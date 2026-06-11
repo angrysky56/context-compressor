@@ -1,6 +1,6 @@
 [project]
 name = "context-compressor"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for compressing and expanding agent context — LCLM-inspired latent chunk management"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,3 +21,14 @@ context-compressor = "context_compressor.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/context_compressor"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+

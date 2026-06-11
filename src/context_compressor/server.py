@@ -1,28 +1,32 @@
 """Context Compressor — MCP server for compressing and expanding agent context.
 
 Tools:
-  compress_pages    — Compress wiki pages / carryover files into latent chunk summaries
-  expand_chunk      — Restore original content for a compressed chunk
+  compress_pages     — Compress wiki pages / carryover files into latent chunk summaries
+  compress_text      — Compress inline text without requiring a file on disk
+  expand_chunk       — Restore original content for a compressed chunk
   get_chunk_metadata — Get metadata for a compressed chunk (ratio, entities, confidence)
+  search_chunks      — Semantic search across compressed chunks by query
+  list_chunks        — List all compressed chunks, optionally filtered by source path
   compression_stats  — Global statistics (total pages, chunks, avg ratio, tokens saved)
-  list_chunks       — List all compressed chunks, optionally filtered by source path
+  purge_stale        — Remove chunks whose source file has changed or been deleted
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import hashlib
-import time
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 
-from mcp.server import Server, InitializationOptions
-from mcp.server.stdio import stdio_server
-from mcp.types import ServerCapabilities, TextContent, Tool
+from mcp.server.fastmcp import FastMCP
 
-from .compressor import Compressor, CompressionResult
-from .types import ChunkMetadata
+from .compressor import (
+    Compressor,
+    CompressionResult,
+    SectionSummary,
+    estimate_tokens,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,7 +37,12 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "00000000")
 NEO4J_DATABASE = os.getenv("NEO4J_DATABASE", "synapse")
 
 # Directory for persisting compressed chunks on disk
-CHUNK_STORE = Path(os.getenv("CONTEXT_COMPRESSOR_STORE", os.path.expanduser("~/.hermes/context-compressor")))
+CHUNK_STORE = Path(
+    os.getenv(
+        "CONTEXT_COMPRESSOR_STORE",
+        os.path.expanduser("~/.hermes/context-compressor"),
+    )
+)
 CHUNK_STORE.mkdir(parents=True, exist_ok=True)
 
 # Manifest file tracks all chunks
@@ -44,11 +53,19 @@ MANIFEST_PATH = CHUNK_STORE / "manifest.json"
 # ---------------------------------------------------------------------------
 _chunk_index: dict[str, dict] = {}
 
+# TF-IDF search index (rebuilt on startup and after compress)
+_search_vectorizer = None
+_search_matrix = None
+_search_chunk_ids: list[str] = []
+
 
 def _load_manifest() -> dict[str, dict]:
     """Load chunk manifest from disk."""
     if MANIFEST_PATH.exists():
-        return json.loads(MANIFEST_PATH.read_text())
+        try:
+            return json.loads(MANIFEST_PATH.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
     return {}
 
 
@@ -57,152 +74,179 @@ def _save_manifest(index: dict[str, dict]) -> None:
     MANIFEST_PATH.write_text(json.dumps(index, indent=2, default=str))
 
 
+def _content_hash(content: str) -> str:
+    """Compute SHA-256 hash of content for deduplication."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 def _chunk_id(source_path: str, ratio: float, timestamp: str) -> str:
     """Generate a stable chunk ID from source path + ratio + timestamp."""
     raw = f"{source_path}:{ratio}:{timestamp}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
-server = Server("context-compressor")
+def _find_existing_chunk(
+    source_path: str, content_hash_val: str, ratio: float
+) -> str | None:
+    """Check if a chunk already exists for this source+hash+ratio.
+
+    Returns the chunk_id if found, None otherwise.
+    """
+    for cid, meta in _chunk_index.items():
+        if (
+            meta.get("source_path") == source_path
+            and meta.get("content_hash") == content_hash_val
+            and meta.get("ratio") == ratio
+        ):
+            return cid
+    return None
 
 
-@server.list_tools()
-async def handle_list_tools() -> list[Tool]:
+def _check_staleness(meta: dict) -> bool:
+    """Check if a chunk's source file has changed since compression.
+
+    Returns True if the source file is missing or its content hash differs.
+    """
+    source_path = meta.get("source_path", "")
+    if not source_path:
+        return False
+    p = Path(source_path)
+    if not p.exists():
+        return True
+    try:
+        current_hash = _content_hash(p.read_text(encoding="utf-8", errors="replace"))
+        return current_hash != meta.get("content_hash", "")
+    except OSError:
+        return True
+
+
+def _rebuild_search_index() -> None:
+    """Rebuild the TF-IDF search index from stored chunks."""
+    global _search_vectorizer, _search_matrix, _search_chunk_ids
+
+    if not _chunk_index:
+        _search_vectorizer = None
+        _search_matrix = None
+        _search_chunk_ids = []
+        return
+
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+    except ImportError:
+        # scikit-learn not available — search disabled
+        _search_vectorizer = None
+        _search_matrix = None
+        _search_chunk_ids = []
+        return
+
+    # Collect compressed content from chunk files
+    corpus: list[str] = []
+    chunk_ids: list[str] = []
+
+    for cid in _chunk_index:
+        chunk_path = CHUNK_STORE / f"{cid}.json"
+        if not chunk_path.exists():
+            continue
+        try:
+            data = json.loads(chunk_path.read_text())
+            compressed = data.get("compressed_content", "")
+            if compressed:
+                corpus.append(compressed)
+                chunk_ids.append(cid)
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    if not corpus:
+        _search_vectorizer = None
+        _search_matrix = None
+        _search_chunk_ids = []
+        return
+
+    vectorizer = TfidfVectorizer(
+        max_features=5000,
+        stop_words="english",
+        sublinear_tf=True,
+    )
+    matrix = vectorizer.fit_transform(corpus)
+
+    _search_vectorizer = vectorizer
+    _search_matrix = matrix
+    _search_chunk_ids = chunk_ids
+
+
+def _section_summaries_to_dicts(
+    sections: list[SectionSummary],
+) -> list[dict]:
+    """Convert SectionSummary objects to JSON-serializable dicts."""
     return [
-        Tool(
-            name="compress_pages",
-            description=(
-                "Compress one or more wiki pages / carryover files into latent chunk summaries. "
-                "Returns chunk IDs and metadata. Supports configurable compression ratio (1-16x). "
-                "Phase 1 uses extractive compression (TF-IDF sentence scoring + entity preservation). "
-                "Phase 2 will use a learned LCLM encoder."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "File paths to compress (wiki pages, carryover files, etc.)",
-                    },
-                    "ratio": {
-                        "type": "number",
-                        "description": "Target compression ratio (1-16, default: 4). Higher = more compression.",
-                    },
-                    "interleave": {
-                        "type": "boolean",
-                        "description": (
-                            "If true and multiple paths given, interleave compressed chunks "
-                            "so the model learns mixed compressed/fresh conditioning (LCLM-style). "
-                            "Default: false."
-                        ),
-                    },
-                    "preserve_entities": {
-                        "type": "boolean",
-                        "description": "Always preserve named entities and key facts (default: true).",
-                    },
-                },
-                "required": ["paths"],
-            },
-        ),
-        Tool(
-            name="expand_chunk",
-            description=(
-                "Restore the original full-text content for a compressed chunk. "
-                "This is the 'selective expansion' operation — the agent skims compressed chunks "
-                "and only expands the ones it needs detail from."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "chunk_id": {
-                        "type": "string",
-                        "description": "The chunk ID returned by compress_pages.",
-                    },
-                },
-                "required": ["chunk_id"],
-            },
-        ),
-        Tool(
-            name="get_chunk_metadata",
-            description=(
-                "Get metadata for a compressed chunk without expanding it. "
-                "Returns: original path, compression ratio, key entities, confidence score, "
-                "token counts, creation timestamp."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "chunk_id": {
-                        "type": "string",
-                        "description": "The chunk ID returned by compress_pages.",
-                    },
-                },
-                "required": ["chunk_id"],
-            },
-        ),
-        Tool(
-            name="list_chunks",
-            description=(
-                "List all compressed chunks in the store. "
-                "Optionally filter by source path prefix."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "source_prefix": {
-                        "type": "string",
-                        "description": "Filter chunks whose original path starts with this prefix (optional).",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max results (default: 50).",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="compression_stats",
-            description=(
-                "Global compression statistics: total pages compressed, total chunks, "
-                "average compression ratio, estimated tokens saved."
-            ),
-            inputSchema={"type": "object", "properties": {}},
-        ),
+        {
+            "title": s.title,
+            "level": s.level,
+            "original_tokens": s.original_tokens,
+            "compressed_tokens": s.compressed_tokens,
+        }
+        for s in sections
     ]
 
 
-@server.call_tool()
-async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
-    if name == "compress_pages":
-        return await _compress_pages(arguments)
-    elif name == "expand_chunk":
-        return await _expand_chunk(arguments)
-    elif name == "get_chunk_metadata":
-        return await _get_chunk_metadata(arguments)
-    elif name == "list_chunks":
-        return await _list_chunks(arguments)
-    elif name == "compression_stats":
-        return await _compression_stats(arguments)
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+def _interleave_results(
+    results: list[dict],
+) -> list[dict]:
+    """Interleave compressed chunk previews from multiple files.
+
+    Creates an alternating sequence so the consuming model gets
+    mixed compressed/fresh conditioning (LCLM-style).
+    """
+    if len(results) <= 1:
+        return results
+
+    # Round-robin interleave by cycling through source files
+    from itertools import zip_longest
+
+    # Group by source
+    by_source: dict[str, list[dict]] = {}
+    for r in results:
+        src = r.get("source_path", "unknown")
+        by_source.setdefault(src, []).append(r)
+
+    sources = list(by_source.values())
+    interleaved = []
+    for group in zip_longest(*sources):
+        for item in group:
+            if item is not None:
+                interleaved.append(item)
+
+    return interleaved
 
 
 # ---------------------------------------------------------------------------
-# Tool implementations
+# Server (FastMCP)
 # ---------------------------------------------------------------------------
+mcp = FastMCP("context-compressor")
 
-async def _compress_pages(args: dict) -> list[TextContent]:
-    """Compress one or more files into latent chunk summaries."""
+
+@mcp.tool()
+async def compress_pages(
+    paths: list[str],
+    ratio: float = 4.0,
+    interleave: bool = False,
+    preserve_entities: bool = True,
+) -> str:
+    """Compress one or more wiki pages / carryover files into latent chunk summaries.
+
+    Returns chunk IDs and metadata. Supports configurable compression ratio (1-16x).
+    Uses structure-aware Markdown parsing with TF-IDF sentence scoring and entity
+    preservation. Deduplicates: if the file content hasn't changed since last
+    compression at the same ratio, returns the existing chunk.
+
+    Args:
+        paths: File paths to compress (wiki pages, carryover files, etc.).
+        ratio: Target compression ratio (1-16, default: 4). Higher = more compression.
+        interleave: If true and multiple paths given, interleave compressed chunks
+            so the model receives mixed compressed/fresh conditioning (LCLM-style).
+        preserve_entities: Always preserve named entities and key facts (default: true).
+    """
     global _chunk_index
-
-    paths: list[str] = args["paths"]
-    ratio: float = args.get("ratio", 4.0)
-    interleave: bool = args.get("interleave", False)
-    preserve_entities: bool = args.get("preserve_entities", True)
 
     # Clamp ratio
     ratio = max(1.0, min(16.0, ratio))
@@ -220,6 +264,27 @@ async def _compress_pages(args: dict) -> list[TextContent]:
             continue
 
         content = path.read_text(encoding="utf-8", errors="replace")
+        chash = _content_hash(content)
+        resolved = str(path.resolve())
+
+        # --- Deduplication: check for existing identical chunk ---
+        existing_cid = _find_existing_chunk(resolved, chash, ratio)
+        if existing_cid:
+            meta = _chunk_index[existing_cid]
+            results.append({
+                "chunk_id": existing_cid,
+                "source_path": path_str,
+                "ratio": ratio,
+                "actual_ratio": meta.get("actual_ratio", ratio),
+                "original_tokens": meta.get("original_tokens", 0),
+                "compressed_tokens": meta.get("compressed_tokens", 0),
+                "key_entities": meta.get("key_entities", []),
+                "confidence": meta.get("confidence", 0.0),
+                "deduplicated": True,
+            })
+            continue
+
+        # --- Compress ---
         compression_result: CompressionResult = compressor.compress(content)
 
         # Generate chunk ID
@@ -229,7 +294,7 @@ async def _compress_pages(args: dict) -> list[TextContent]:
         # Build metadata
         metadata = {
             "chunk_id": cid,
-            "source_path": str(path.resolve()),
+            "source_path": resolved,
             "ratio": ratio,
             "original_tokens": compression_result.original_tokens,
             "compressed_tokens": compression_result.compressed_tokens,
@@ -238,6 +303,9 @@ async def _compress_pages(args: dict) -> list[TextContent]:
             "confidence": compression_result.confidence,
             "created_at": timestamp,
             "interleaved": interleave,
+            "content_hash": chash,
+            "is_stale": False,
+            "sections": _section_summaries_to_dicts(compression_result.sections),
         }
 
         # Persist compressed chunk to disk
@@ -261,151 +329,362 @@ async def _compress_pages(args: dict) -> list[TextContent]:
             "compressed_tokens": compression_result.compressed_tokens,
             "key_entities": compression_result.key_entities,
             "confidence": compression_result.confidence,
-            "compressed_preview": compression_result.compressed_text[:200] + "..."
-                if len(compression_result.compressed_text) > 200
-                else compression_result.compressed_text,
+            "sections": [s.title for s in compression_result.sections],
+            "compressed_preview": (
+                compression_result.compressed_text[:300] + "..."
+                if len(compression_result.compressed_text) > 300
+                else compression_result.compressed_text
+            ),
         })
 
+    # Rebuild search index with new chunks
+    _rebuild_search_index()
+
+    # Apply interleaving if requested
+    success_results = [r for r in results if "error" not in r]
+    if interleave:
+        success_results = _interleave_results(success_results)
+
     output = {
-        "chunks_created": len([r for r in results if "error" not in r]),
+        "chunks_created": len(success_results),
         "errors": [r for r in results if "error" in r],
-        "chunks": [r for r in results if "error" not in r],
+        "chunks": success_results,
         "interleaved": interleave,
     }
 
-    return [TextContent(type="text", text=json.dumps(output, indent=2))]
+    return json.dumps(output, indent=2)
 
 
-async def _expand_chunk(args: dict) -> list[TextContent]:
-    """Restore original content for a compressed chunk."""
-    cid: str = args["chunk_id"]
-    chunk_path = CHUNK_STORE / f"{cid}.json"
+@mcp.tool()
+async def compress_text(
+    text: str,
+    ratio: float = 4.0,
+    preserve_entities: bool = True,
+    persist: bool = False,
+    label: str = "inline",
+) -> str:
+    """Compress inline text without requiring a file on disk.
+
+    Useful for compressing conversation history, tool output, pasted content,
+    or any text the agent already has in context.
+
+    Args:
+        text: The text content to compress.
+        ratio: Target compression ratio (1-16, default: 4).
+        preserve_entities: Always preserve named entities and key facts.
+        persist: If true, save the compressed chunk to disk for later retrieval.
+        label: A label for this chunk (used as source_path if persisted).
+    """
+    global _chunk_index
+
+    ratio = max(1.0, min(16.0, ratio))
+    compressor = Compressor(ratio=ratio, preserve_entities=preserve_entities)
+    result: CompressionResult = compressor.compress(text)
+
+    output = {
+        "original_tokens": result.original_tokens,
+        "compressed_tokens": result.compressed_tokens,
+        "actual_ratio": result.actual_ratio,
+        "key_entities": result.key_entities,
+        "confidence": result.confidence,
+        "sections": [s.title for s in result.sections],
+        "compressed_text": result.compressed_text,
+    }
+
+    if persist:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        chash = _content_hash(text)
+        cid = _chunk_id(label, ratio, timestamp)
+
+        metadata = {
+            "chunk_id": cid,
+            "source_path": f"inline:{label}",
+            "ratio": ratio,
+            "original_tokens": result.original_tokens,
+            "compressed_tokens": result.compressed_tokens,
+            "actual_ratio": result.actual_ratio,
+            "key_entities": result.key_entities,
+            "confidence": result.confidence,
+            "created_at": timestamp,
+            "interleaved": False,
+            "content_hash": chash,
+            "is_stale": False,
+            "sections": _section_summaries_to_dicts(result.sections),
+        }
+
+        chunk_path = CHUNK_STORE / f"{cid}.json"
+        chunk_path.write_text(json.dumps({
+            "metadata": metadata,
+            "compressed_content": result.compressed_text,
+            "original_content": text,
+        }, indent=2))
+
+        _chunk_index[cid] = metadata
+        _save_manifest(_chunk_index)
+        _rebuild_search_index()
+
+        output["chunk_id"] = cid
+        output["persisted"] = True
+
+    return json.dumps(output, indent=2)
+
+
+@mcp.tool()
+async def expand_chunk(chunk_id: str) -> str:
+    """Restore the original full-text content for a compressed chunk.
+
+    This is the 'selective expansion' operation — the agent skims compressed
+    chunks and only expands the ones it needs detail from.
+
+    Args:
+        chunk_id: The chunk ID returned by compress_pages or compress_text.
+    """
+    chunk_path = CHUNK_STORE / f"{chunk_id}.json"
 
     if not chunk_path.exists():
-        # Check if it's in the manifest but file was deleted
-        if cid in _chunk_index:
-            return [TextContent(
-                type="text",
-                text=json.dumps({
-                    "error": f"Chunk file missing for {cid}. Manifest entry exists but file was deleted.",
-                    "metadata": _chunk_index[cid],
-                }, indent=2)
-            )]
-        return [TextContent(
-            type="text",
-            text=json.dumps({"error": f"Chunk not found: {cid}"}, indent=2)
-        )]
+        if chunk_id in _chunk_index:
+            return json.dumps({
+                "error": f"Chunk file missing for {chunk_id}. Manifest entry exists but file was deleted.",
+                "metadata": _chunk_index[chunk_id],
+            }, indent=2)
+        return json.dumps({"error": f"Chunk not found: {chunk_id}"}, indent=2)
 
     chunk_data = json.loads(chunk_path.read_text())
     original_content = chunk_data["original_content"]
     metadata = chunk_data["metadata"]
 
-    return [TextContent(
-        type="text",
-        text=json.dumps({
-            "chunk_id": cid,
-            "source_path": metadata["source_path"],
-            "original_tokens": metadata["original_tokens"],
-            "content": original_content,
+    return json.dumps({
+        "chunk_id": chunk_id,
+        "source_path": metadata["source_path"],
+        "original_tokens": metadata["original_tokens"],
+        "content": original_content,
+    }, indent=2)
+
+
+@mcp.tool()
+async def get_chunk_metadata(chunk_id: str) -> str:
+    """Get metadata for a compressed chunk without expanding it.
+
+    Returns: original path, compression ratio, key entities, confidence score,
+    token counts, creation timestamp, section outline, staleness status.
+
+    Args:
+        chunk_id: The chunk ID returned by compress_pages or compress_text.
+    """
+    if chunk_id in _chunk_index:
+        meta = dict(_chunk_index[chunk_id])
+        # Update staleness
+        meta["is_stale"] = _check_staleness(meta)
+        return json.dumps(meta, indent=2, default=str)
+
+    return json.dumps({"error": f"Chunk not found: {chunk_id}"}, indent=2)
+
+
+@mcp.tool()
+async def search_chunks(query: str, top_k: int = 5) -> str:
+    """Semantic search across compressed chunks by query.
+
+    Uses TF-IDF similarity to find chunks most relevant to the query.
+    Returns ranked results with relevance scores, chunk IDs, source paths,
+    and compressed previews.
+
+    Args:
+        query: Search query text.
+        top_k: Maximum number of results to return (default: 5).
+    """
+    if _search_vectorizer is None or _search_matrix is None:
+        return json.dumps({
+            "error": "Search index not available. Compress some content first.",
+            "results": [],
         }, indent=2)
-    )]
+
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    query_vec = _search_vectorizer.transform([query])
+    similarities = cosine_similarity(query_vec, _search_matrix).flatten()
+
+    # Get top-k indices
+    top_indices = similarities.argsort()[::-1][:top_k]
+
+    results = []
+    for idx in top_indices:
+        score = float(similarities[idx])
+        if score < 0.01:
+            continue  # skip negligible matches
+
+        cid = _search_chunk_ids[idx]
+        meta = _chunk_index.get(cid, {})
+
+        # Load compressed preview
+        preview = ""
+        chunk_path = CHUNK_STORE / f"{cid}.json"
+        if chunk_path.exists():
+            try:
+                data = json.loads(chunk_path.read_text())
+                compressed = data.get("compressed_content", "")
+                preview = compressed[:300] + "..." if len(compressed) > 300 else compressed
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        results.append({
+            "chunk_id": cid,
+            "relevance_score": round(score, 4),
+            "source_path": meta.get("source_path", ""),
+            "key_entities": meta.get("key_entities", []),
+            "original_tokens": meta.get("original_tokens", 0),
+            "compressed_tokens": meta.get("compressed_tokens", 0),
+            "confidence": meta.get("confidence", 0.0),
+            "compressed_preview": preview,
+        })
+
+    return json.dumps({
+        "query": query,
+        "returned": len(results),
+        "results": results,
+    }, indent=2)
 
 
-async def _get_chunk_metadata(args: dict) -> list[TextContent]:
-    """Get metadata for a compressed chunk without expanding."""
-    cid: str = args["chunk_id"]
+@mcp.tool()
+async def list_chunks(
+    source_prefix: str | None = None,
+    limit: int = 50,
+) -> str:
+    """List all compressed chunks in the store.
 
-    if cid in _chunk_index:
-        return [TextContent(
-            type="text",
-            text=json.dumps(_chunk_index[cid], indent=2, default=str)
-        )]
+    Optionally filter by source path prefix.
 
-    return [TextContent(
-        type="text",
-        text=json.dumps({"error": f"Chunk not found: {cid}"}, indent=2)
-    )]
-
-
-async def _list_chunks(args: dict) -> list[TextContent]:
-    """List compressed chunks, optionally filtered by source prefix."""
-    source_prefix: str | None = args.get("source_prefix")
-    limit: int = args.get("limit", 50)
-
+    Args:
+        source_prefix: Filter chunks whose original path starts with this prefix.
+        limit: Maximum number of results (default: 50).
+    """
     chunks = list(_chunk_index.values())
 
     if source_prefix:
-        chunks = [c for c in chunks if c["source_path"].startswith(source_prefix)]
+        chunks = [
+            c for c in chunks if c["source_path"].startswith(source_prefix)
+        ]
 
     # Sort by creation time, newest first
     chunks.sort(key=lambda c: c.get("created_at", ""), reverse=True)
     chunks = chunks[:limit]
 
-    return [TextContent(
-        type="text",
-        text=json.dumps({
-            "total": len(_chunk_index),
-            "returned": len(chunks),
-            "chunks": chunks,
-        }, indent=2, default=str)
-    )]
+    return json.dumps({
+        "total": len(_chunk_index),
+        "returned": len(chunks),
+        "chunks": chunks,
+    }, indent=2, default=str)
 
 
-async def _compression_stats(args: dict) -> list[TextContent]:
-    """Global compression statistics."""
+@mcp.tool()
+async def compression_stats() -> str:
+    """Global compression statistics.
+
+    Returns total pages compressed, total chunks, average compression ratio,
+    estimated tokens saved, and count of stale chunks.
+    """
     total_chunks = len(_chunk_index)
     if total_chunks == 0:
-        return [TextContent(
-            type="text",
-            text=json.dumps({
-                "total_chunks": 0,
-                "message": "No chunks compressed yet.",
-            }, indent=2)
-        )]
-
-    total_original = sum(c.get("original_tokens", 0) for c in _chunk_index.values())
-    total_compressed = sum(c.get("compressed_tokens", 0) for c in _chunk_index.values())
-    avg_ratio = sum(c.get("actual_ratio", 0) for c in _chunk_index.values()) / total_chunks
-    avg_confidence = sum(c.get("confidence", 0) for c in _chunk_index.values()) / total_chunks
-    unique_sources = len(set(c["source_path"] for c in _chunk_index.values()))
-
-    return [TextContent(
-        type="text",
-        text=json.dumps({
-            "total_chunks": total_chunks,
-            "unique_sources": unique_sources,
-            "total_original_tokens": total_original,
-            "total_compressed_tokens": total_compressed,
-            "tokens_saved": total_original - total_compressed,
-            "avg_compression_ratio": round(avg_ratio, 2),
-            "avg_confidence": round(avg_confidence, 3),
-            "store_path": str(CHUNK_STORE),
+        return json.dumps({
+            "total_chunks": 0,
+            "message": "No chunks compressed yet.",
         }, indent=2)
-    )]
+
+    total_original = sum(
+        c.get("original_tokens", 0) for c in _chunk_index.values()
+    )
+    total_compressed = sum(
+        c.get("compressed_tokens", 0) for c in _chunk_index.values()
+    )
+    avg_ratio = (
+        sum(c.get("actual_ratio", 0) for c in _chunk_index.values())
+        / total_chunks
+    )
+    avg_confidence = (
+        sum(c.get("confidence", 0) for c in _chunk_index.values())
+        / total_chunks
+    )
+    unique_sources = len(
+        set(c["source_path"] for c in _chunk_index.values())
+    )
+
+    # Count stale chunks
+    stale_count = sum(1 for c in _chunk_index.values() if _check_staleness(c))
+
+    return json.dumps({
+        "total_chunks": total_chunks,
+        "unique_sources": unique_sources,
+        "total_original_tokens": total_original,
+        "total_compressed_tokens": total_compressed,
+        "tokens_saved": total_original - total_compressed,
+        "avg_compression_ratio": round(avg_ratio, 2),
+        "avg_confidence": round(avg_confidence, 3),
+        "stale_chunks": stale_count,
+        "store_path": str(CHUNK_STORE),
+    }, indent=2)
+
+
+@mcp.tool()
+async def purge_stale(dry_run: bool = True) -> str:
+    """Remove chunks whose source file has changed or been deleted.
+
+    Args:
+        dry_run: If true (default), report which chunks would be purged
+            without actually deleting them. Set to false to delete.
+    """
+    global _chunk_index
+
+    stale: list[dict] = []
+    for cid, meta in list(_chunk_index.items()):
+        if _check_staleness(meta):
+            stale.append({
+                "chunk_id": cid,
+                "source_path": meta.get("source_path", ""),
+                "created_at": meta.get("created_at", ""),
+                "reason": (
+                    "source deleted"
+                    if not Path(meta.get("source_path", "")).exists()
+                    else "content changed"
+                ),
+            })
+
+    if not dry_run:
+        for entry in stale:
+            cid = entry["chunk_id"]
+            # Remove chunk file
+            chunk_path = CHUNK_STORE / f"{cid}.json"
+            if chunk_path.exists():
+                chunk_path.unlink()
+            # Remove from index
+            _chunk_index.pop(cid, None)
+
+        _save_manifest(_chunk_index)
+        _rebuild_search_index()
+
+    return json.dumps({
+        "dry_run": dry_run,
+        "stale_count": len(stale),
+        "stale_chunks": stale,
+        "message": (
+            f"Would purge {len(stale)} stale chunk(s)."
+            if dry_run
+            else f"Purged {len(stale)} stale chunk(s)."
+        ),
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main():
-    import anyio
-
+def main() -> None:
+    """Start the context-compressor MCP server."""
     # Load manifest on startup
     global _chunk_index
     _chunk_index = _load_manifest()
 
-    async def run():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream, write_stream,
-                InitializationOptions(
-                    server_name="context-compressor",
-                    server_version="0.1.0",
-                    capabilities=ServerCapabilities(),
-                ),
-            )
+    # Build search index from existing chunks
+    _rebuild_search_index()
 
-    anyio.run(run)
+    mcp.run()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,14 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
+class SectionInfo(BaseModel):
+    """Summary of a compressed section in the output."""
+    title: str = Field(description="Section heading text")
+    level: int = Field(ge=1, le=6, description="Heading depth (1-6)")
+    original_tokens: int = Field(ge=0, description="Token count of original section body")
+    compressed_tokens: int = Field(ge=0, description="Token count of compressed section body")
+
+
 class ChunkMetadata(BaseModel):
     """Metadata for a compressed chunk."""
     chunk_id: str
@@ -17,6 +25,9 @@ class ChunkMetadata(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, description="Compression quality estimate")
     created_at: str = Field(description="ISO timestamp")
     interleaved: bool = Field(default=False, description="Whether this was interleaved with other chunks")
+    content_hash: str = Field(default="", description="SHA-256 hash of original file content")
+    is_stale: bool = Field(default=False, description="True if source file has changed since compression")
+    sections: list[SectionInfo] = Field(default_factory=list, description="Section summaries")
 
 
 class CompressionRequest(BaseModel):
@@ -37,3 +48,4 @@ class CompressionStats(BaseModel):
     avg_compression_ratio: float
     avg_confidence: float
     store_path: str
+    stale_chunks: int = Field(default=0, description="Number of chunks whose source has changed")
