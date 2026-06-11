@@ -10,6 +10,10 @@ dependencies = [
     "pydantic>=2.0.0",
     "scikit-learn>=1.0.0",
     "numpy>=1.24.0",
+    "transformers>=4.40.0",
+    "safetensors>=0.4.0",
+    # torch is expected to be pre-installed (system or conda)
+    # Do not add "torch" here — uv will try to download it
 ]
 
 [build-system]

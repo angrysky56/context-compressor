@@ -4,7 +4,7 @@
       "command": "uv",
       "args": [
         "--directory",
-        "/home/ty/Repositories/ai_workspace/context-compressor",
+        "/path/to/context-compressor",
         "run",
         "context-compressor"
       ],
@@ -13,7 +13,7 @@
         "NEO4J_USERNAME": "neo4j",
         "NEO4J_PASSWORD": "your_neo4j_password_here",
         "NEO4J_DATABASE": "synapse",
-        "CONTEXT_COMPRESSOR_STORE": "/home/ty/.hermes/context-compressor"
+        "CONTEXT_COMPRESSOR_STORE": "/home/wherever-is-convenient/context-compressor-store"
       }
     }
   }

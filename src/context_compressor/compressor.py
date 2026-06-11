@@ -458,6 +458,8 @@ class Compressor:
     Supports hierarchical compression: sections are compressed independently
     and the document outline is always preserved.
 
+    For Phase 2 (learned LCLM encoder), use the LCLMEncoder class directly.
+
     Args:
         ratio: Target compression ratio (1-16). Higher = more aggressive.
         preserve_entities: If True, always include blocks containing

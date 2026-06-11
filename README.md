@@ -18,12 +18,21 @@ This server enables LLM agents to compress large wiki pages, long documents, or 
 *   **Inline Text Compression** — Compress text directly without needing a file on disk (conversation history, tool output, etc.).
 *   **LCLM-Style Interleaving** — Alternates compressed chunks from multiple files for mixed conditioning.
 *   **Configurable Ratio** — Compression ratio from 1× (minimal) to 16× (aggressive).
-
-### Roadmap
-
-*   **Phase 2 (Planned):** Learned LCLM encoder (0.6B model from [arXiv:2606.09659](https://arxiv.org/abs/2606.09659)) for true p(x|z) reconstruction, replacing extractive compression with generative latent codes.
+*   **Learned LCLM encoder** (0.6B model from [arXiv:2606.09659](https://arxiv.org/abs/2606.09659)) for true p(x|z) reconstruction, replacing extractive compression with generative latent codes.
 
 ---
+
+All 8 context-compressor tools tested ✓,
+| Tool | Status |
+|------|--------|
+| compress_pages |  Compresses wiki pages with deduplication, entity preservation, hierarchical sections |
+| compress_text |  Compresses inline text without file I/O |
+| expand_chunk |  Restores original full-text from chunk ID |
+| get_chunk_metadata |  Returns ratio, entities, confidence, sections, staleness |
+| search_chunks |  TF-IDF semantic search across compressed chunks |
+| list_chunks |  Lists chunks with source prefix filtering |
+| compression_stats |  Global stats: tokens saved, avg ratio, stale count |
+| purge_stale |  Dry-run and actual purge of stale chunks |
 
 ## 📂 Codebase Overview
 
@@ -41,6 +50,8 @@ This server enables LLM agents to compress large wiki pages, long documents, or 
 ## 🛠️ Installation & Setup
 
 Requires [uv](https://github.com/astral-sh/uv) and Python ≥ 3.12.
+
+LCLMEncoder requires PyTorch. You can install it with `pip install torch` or `uv pip install torch`.
 
 ```bash
 # Install all dependencies
@@ -80,7 +91,7 @@ Copy [mcp-config.example.json](mcp-config.example.json) into your MCP client con
         "context-compressor"
       ],
       "env": {
-        "CONTEXT_COMPRESSOR_STORE": "~/.hermes/context-compressor"
+        "CONTEXT_COMPRESSOR_STORE": "/home/wherever-is-convenient/context-compressor-store"
       }
     }
   }
