@@ -1,8 +1,12 @@
 # Context Compressor MCP Server
 
-An MCP (Model Context Protocol) server for compressing and expanding agent context using LCLM-inspired latent chunk management.
+An MCP (Model Context Protocol) server for compressing and expanding agent context using structure-aware extractive compression.
 
 This server enables LLM agents to compress large wiki pages, long documents, or carryover files into condensed summaries, conserving context window tokens. The agent can skim the metadata of these compressed chunks, **search** them semantically, and selectively expand only the ones it needs detail from.
+
+**What this is:** An extractive compressor. It selects the most informative sentences from the original text using TF-IDF scoring, preserves document structure, and stores the compressed text alongside the original for on-demand expansion.
+
+**What this is not:** A learned LCLM encoder. LCLM (arXiv 2606.09659) requires a jointly-trained 0.6B encoder + 4B decoder pair. The latents are decoder-specific — they only mean something to the LCLM decoder they were trained with. Since Hermes routes to arbitrary OpenRouter models (which eat tokens, not latent embeddings), LCLM latents would be useless without running the LCLM decoder locally. For an agent gateway architecture, text-out compression is the only kind that transfers.
 
 ---
 
@@ -12,13 +16,12 @@ This server enables LLM agents to compress large wiki pages, long documents, or 
 - **Hierarchical Compression** — Sections are compressed independently; the document outline (all headings) is always preserved in the output.
 - **TF-IDF Sentence Scoring** — Ranks content blocks by information density with bonuses for entities, structural markers, and position.
 - **Entity Preservation** — Named entities and configurable domain-specific terms (e.g., `ELBO`, `PAC-Bayes`, `MCMC`) are prioritized during compression.
-- **Semantic Search** — TF-IDF vectorized search across all compressed chunks without expanding them.
+- **Embedding Search** — Qwen3-Embedding-0.6B for real semantic similarity (not TF-IDF). Lazy-loaded on first search.
 - **Content-Hash Deduplication** — Re-compressing an unchanged file returns the existing chunk instantly.
 - **Staleness Detection** — Detects when source files have changed since compression and supports bulk purging.
 - **Inline Text Compression** — Compress text directly without needing a file on disk (conversation history, tool output, etc.).
-- **LCLM-Style Interleaving** — Alternates compressed chunks from multiple files for mixed conditioning.
 - **Configurable Ratio** — Compression ratio from 1× (minimal) to 16× (aggressive).
-- **Learned LCLM encoder** (0.6B model from [arXiv:2606.09659](https://arxiv.org/abs/2606.09659)) for true p(x|z) reconstruction, replacing extractive compression with generative latent codes.
+- **Honest Confidence** — Compression quality score computed from ratio accuracy × entity coverage, not hardcoded.
 
 ---
 
@@ -37,12 +40,12 @@ All 8 context-compressor tools tested ✓
 
 ## 📂 Codebase Overview
 
-| File                                                  | Purpose                                                   |
-| ----------------------------------------------------- | --------------------------------------------------------- |
-| [server.py](src/context_compressor/server.py)         | FastMCP server with 8 tool registrations                  |
-| [compressor.py](src/context_compressor/compressor.py) | Structure-aware extractive compression engine             |
-| [types.py](src/context_compressor/types.py)           | Pydantic models for metadata and request/response schemas |
-| [pyproject.toml](pyproject.toml)                      | Build configuration and dependencies                      |
+| File                                                  | Purpose                                                           |
+| ----------------------------------------------------- | ----------------------------------------------------------------- |
+| [server.py](src/context_compressor/server.py)         | FastMCP server with 8 tool registrations                          |
+| [compressor.py](src/context_compressor/compressor.py) | Structure-aware extractive compression engine                     |
+| [types.py](src/context_compressor/types.py)           | Pydantic models for metadata and request/response schemas         |
+| [pyproject.toml](pyproject.toml)                      | Build configuration and dependencies                              |
 | [mcp-config.example.json](mcp-config.example.json)    | Example MCP client configuration                          |
 | [tests/](tests/)                                      | 67 tests covering compressor and server tools             |
 
@@ -51,8 +54,6 @@ All 8 context-compressor tools tested ✓
 ## 🛠️ Installation & Setup
 
 Requires [uv](https://github.com/astral-sh/uv) and Python ≥ 3.12.
-
-LCLMEncoder requires PyTorch. You can install it with `pip install torch` or `uv pip install torch`.
 
 ```bash
 # Install all dependencies

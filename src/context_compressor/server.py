@@ -22,8 +22,6 @@ from pathlib import Path
 from itertools import zip_longest
 
 from mcp.server.fastmcp import FastMCP
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 from .compressor import (
     Compressor,
@@ -57,17 +55,127 @@ MANIFEST_PATH = CHUNK_STORE / "manifest.json"
 _chunk_index: dict[str, dict] = {}
 
 
-class SearchIndexState:
-    """In-memory TF-IDF search index state."""
+class EmbeddingSearchIndex:
+    """In-memory embedding search index using Qwen3-Embedding-0.6B.
+
+    Uses real sentence embeddings instead of TF-IDF for semantic search.
+    The embedding model is lazy-loaded on first use.
+    """
 
     def __init__(self) -> None:
-        self.vectorizer: TfidfVectorizer | None = None
-        self.matrix = None
+        self.model = None
+        self.tokenizer = None
+        self.embedding_matrix: list[list[float]] = []
         self.chunk_ids: list[str] = []
+        self._loaded = False
+
+    def _load_model(self):
+        """Lazy-load the Qwen3-Embedding model."""
+        if self._loaded:
+            return
+
+        from transformers import AutoModel, AutoTokenizer
+
+        model_name = os.getenv(
+            "EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B"
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
+
+        # Use GPU if available
+        import torch
+        if torch.cuda.is_available():
+            self.model = self.model.cuda()
+
+        self._loaded = True
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of texts. Returns list of embedding vectors."""
+        import torch
+
+        self._load_model()
+
+        # Tokenize
+        inputs = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        )
+        if torch.cuda.is_available():
+            inputs = {k: v.cuda() for k, v in inputs.items()}
+
+        # Forward pass
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Use mean pooling over token embeddings
+            embeddings = outputs.last_hidden_state
+            attention_mask = inputs["attention_mask"].unsqueeze(-1)
+            masked = embeddings * attention_mask
+            summed = masked.sum(dim=1)
+            counts = attention_mask.sum(dim=1).clamp(min=1e-9)
+            embeddings = summed / counts
+
+        # Normalize to unit vectors for cosine similarity
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+        return embeddings.cpu().tolist()
+
+    def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
+        """Search for the top-k most similar chunks to the query.
+
+        Returns list of (chunk_id, similarity_score) tuples.
+        """
+        import torch
+        import numpy as np
+
+        if not self.embedding_matrix or not self.chunk_ids:
+            return []
+
+        # Embed the query
+        query_embedding = self.embed_texts([query])[0]
+        query_vec = np.array(query_embedding)
+
+        # Compute cosine similarities (embeddings are already normalized)
+        matrix = np.array(self.embedding_matrix)
+        similarities = matrix @ query_vec  # dot product = cosine for unit vectors
+
+        # Get top-k
+        top_indices = similarities.argsort()[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            score = float(similarities[idx])
+            if score < 0.1:
+                continue  # skip very low similarity
+            results.append((self.chunk_ids[idx], score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def clear(self):
+        """Clear the index."""
+        self.embedding_matrix = []
+        self.chunk_ids = []
+
+    def unload(self):
+        """Free model memory."""
+        self.model = None
+        self.tokenizer = None
+        self._loaded = False
+        self.clear()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
 
-# TF-IDF search index (rebuilt on startup and after compress)
-_search_index = SearchIndexState()
+# Embedding search index (rebuilt on startup and after compress)
+_search_index = EmbeddingSearchIndex()
 
 
 def _load_manifest() -> dict[str, dict]:
@@ -132,11 +240,10 @@ def _check_staleness(meta: dict) -> bool:
 
 
 def _rebuild_search_index() -> None:
-    """Rebuild the TF-IDF search index from stored chunks."""
+    """Rebuild the embedding search index from stored chunks."""
+    _search_index.clear()
+
     if not _chunk_index:
-        _search_index.vectorizer = None
-        _search_index.matrix = None
-        _search_index.chunk_ids = []
         return
 
     # Collect compressed content from chunk files
@@ -157,21 +264,16 @@ def _rebuild_search_index() -> None:
             continue
 
     if not corpus:
-        _search_index.vectorizer = None
-        _search_index.matrix = None
-        _search_index.chunk_ids = []
         return
 
-    vectorizer = TfidfVectorizer(
-        max_features=5000,
-        stop_words="english",
-        sublinear_tf=True,
-    )
-    matrix = vectorizer.fit_transform(corpus)
-
-    _search_index.vectorizer = vectorizer
-    _search_index.matrix = matrix
-    _search_index.chunk_ids = chunk_ids
+    # Batch embed all compressed chunks
+    try:
+        embeddings = _search_index.embed_texts(corpus)
+        _search_index.embedding_matrix = embeddings
+        _search_index.chunk_ids = chunk_ids
+    except Exception as e:
+        # If embedding fails (e.g., model not available), search will return empty
+        pass
 
 
 def _section_summaries_to_dicts(
@@ -482,7 +584,7 @@ async def get_chunk_metadata(chunk_id: str) -> str:
 async def search_chunks(query: str, top_k: int = 5) -> str:
     """Semantic search across compressed chunks by query.
 
-    Uses TF-IDF similarity to find chunks most relevant to the query.
+    Uses Qwen3-Embedding-0.6B for real embedding similarity (not TF-IDF).
     Returns ranked results with relevance scores, chunk IDs, source paths,
     and compressed previews.
 
@@ -490,25 +592,18 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
         query: Search query text.
         top_k: Maximum number of results to return (default: 5).
     """
-    if _search_index.vectorizer is None or _search_index.matrix is None:
+    results = _search_index.search(query, top_k)
+
+    if not results:
         return json.dumps({
-            "error": "Search index not available. Compress some content first.",
+            "query": query,
+            "returned": 0,
             "results": [],
+            "message": "No results. Compress some content first, or the embedding model may not be available.",
         }, indent=2)
 
-    query_vec = _search_index.vectorizer.transform([query])
-    similarities = cosine_similarity(query_vec, _search_index.matrix).flatten()
-
-    # Get top-k indices
-    top_indices = similarities.argsort()[::-1][:top_k]
-
-    results = []
-    for idx in top_indices:
-        score = float(similarities[idx])
-        if score < 0.01:
-            continue  # skip negligible matches
-
-        cid = _search_index.chunk_ids[idx]
+    output_results = []
+    for cid, score in results:
         meta = _chunk_index.get(cid, {})
 
         # Load compressed preview
@@ -522,7 +617,7 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
             except (json.JSONDecodeError, OSError):
                 pass
 
-        results.append({
+        output_results.append({
             "chunk_id": cid,
             "relevance_score": round(score, 4),
             "source_path": meta.get("source_path", ""),
@@ -535,8 +630,8 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
 
     return json.dumps({
         "query": query,
-        "returned": len(results),
-        "results": results,
+        "returned": len(output_results),
+        "results": output_results,
     }, indent=2)
 
 

@@ -11,7 +11,6 @@ from .compressor import (
     estimate_tokens,
     DEFAULT_IMPORTANT_TERMS,
 )
-from .lclm_encoder import LCLMEncoder, LCLMCompressionResult
 from .types import ChunkMetadata, CompressionRequest, CompressionStats, SectionInfo
 
 __all__ = [
@@ -20,8 +19,6 @@ __all__ = [
     "CompressionResult",
     "ContentBlock",
     "SectionSummary",
-    "LCLMEncoder",
-    "LCLMCompressionResult",
     "ChunkMetadata",
     "CompressionRequest",
     "CompressionStats",

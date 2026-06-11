@@ -72,3 +72,33 @@ All 67 tests pass. The test suite covers:
 - Full tool lifecycle: compress → list → metadata → expand → search → purge
 - Deduplication: same file compressed twice returns cached chunk
 - Staleness: modified/deleted source files detected and purgeable
+
+---
+
+## Post-v0.2.0: LCLM Encoder Removal
+
+An `LCLMEncoder` class was added (then removed) as a Phase 2 experiment. Key lessons:
+
+1. **Dead code**: It was never wired to any MCP tool — `server.py` only imported `Compressor`
+2. **Wrong model**: Loaded generic `Qwen3-Embedding-0.6B`, not the trained LCLM checkpoint
+3. **Ad-hoc pooling**: Used grouped mean-pooling instead of the paper's learned compression
+4. **No decoder**: Without the LCLM 4B decoder, latents can't reconstruct text — `expand_chunk` only worked because original text was stored verbatim
+5. **Hardcoded confidence**: `confidence=0.9` — the exact anti-pattern for a metacognition project
+6. **Stdout corruption risk**: `print()` calls in lazy-load would corrupt the stdio MCP protocol
+7. **Storage math**: Latents inflate storage ~25× vs original text (100 latents × 1024-dim × 2 bytes = ~200KB for an 8KB document)
+8. **Architecture mismatch**: LCLM latents are decoder-specific. Hermes routes to arbitrary OpenRouter models that eat tokens, not latent embeddings. Text-out compression is the only kind that transfers.
+
+**Decision**: Remove `LCLMEncoder` entirely. The extractive compressor is the production tool. If LCLM is ever needed, it requires the full 0.6B encoder + 4B decoder running locally — a separate project, not a context-compression layer for Hermes.
+
+## Post-v0.2.0: Embedding Search Upgrade
+
+Replaced TF-IDF search with Qwen3-Embedding-0.6B for real semantic similarity. This salvages the one genuinely useful thing from the LCLM encoder experiment — the embedding model — and uses it for what it's actually good at: search.
+
+**What changed:**
+- `SearchIndexState` (TF-IDF) → `EmbeddingSearchIndex` (Qwen3-Embedding-0.6B)
+- `_rebuild_search_index()` now batch-embeds all compressed chunks
+- `search_chunks` uses cosine similarity on real embeddings
+- Model is lazy-loaded on first search (not at startup)
+- Falls back gracefully if model unavailable
+
+**Why this works:** The embedding model produces unit-normalized vectors. Cosine similarity = dot product. No decoder needed — just embed the query, compare against stored chunk embeddings, return top-k. Storage model unchanged (embeddings are ~2KB per chunk, stored in memory only).

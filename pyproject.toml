@@ -1,7 +1,7 @@
 [project]
 name = "context-compressor"
 version = "0.2.0"
-description = "MCP server for compressing and expanding agent context — LCLM-inspired latent chunk management"
+description = "MCP server for compressing and expanding agent context — structure-aware extractive compression"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.0.0",
@@ -10,10 +10,8 @@ dependencies = [
     "pydantic>=2.0.0",
     "scikit-learn>=1.0.0",
     "numpy>=1.24.0",
+    "torch>=2.0.0",
     "transformers>=4.40.0",
-    "safetensors>=0.4.0",
-    # torch is expected to be pre-installed (system or conda)
-    # Do not add "torch" here — uv will try to download it
 ]
 
 [build-system]

@@ -1,11 +1,12 @@
-"""Extractive compression engine — Phase 1.
+"""Extractive compression engine.
 
 Implements structure-aware Markdown parsing + TF-IDF sentence scoring
 + entity preservation for compressing wiki pages and carryover files
-into latent chunk summaries with hierarchical section structure.
+into condensed summaries with hierarchical section structure.
 
-Phase 2 will replace this with a learned LCLM encoder (0.6B model from
-arXiv 2606.09659) for true p(x|z) reconstruction.
+This is the production compressor. It selects the most informative sentences
+from the original text, preserves document structure, and stores the compressed
+text alongside the original for on-demand expansion.
 """
 
 from __future__ import annotations
@@ -457,8 +458,6 @@ class Compressor:
 
     Supports hierarchical compression: sections are compressed independently
     and the document outline is always preserved.
-
-    For Phase 2 (learned LCLM encoder), use the LCLMEncoder class directly.
 
     Args:
         ratio: Target compression ratio (1-16). Higher = more aggressive.
