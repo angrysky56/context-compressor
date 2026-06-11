@@ -19,13 +19,16 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from itertools import zip_longest
+
 from mcp.server.fastmcp import FastMCP
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 from .compressor import (
     Compressor,
     CompressionResult,
     SectionSummary,
-    estimate_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,10 +56,18 @@ MANIFEST_PATH = CHUNK_STORE / "manifest.json"
 # ---------------------------------------------------------------------------
 _chunk_index: dict[str, dict] = {}
 
+
+class SearchIndexState:
+    """In-memory TF-IDF search index state."""
+
+    def __init__(self) -> None:
+        self.vectorizer: TfidfVectorizer | None = None
+        self.matrix = None
+        self.chunk_ids: list[str] = []
+
+
 # TF-IDF search index (rebuilt on startup and after compress)
-_search_vectorizer = None
-_search_matrix = None
-_search_chunk_ids: list[str] = []
+_search_index = SearchIndexState()
 
 
 def _load_manifest() -> dict[str, dict]:
@@ -122,21 +133,10 @@ def _check_staleness(meta: dict) -> bool:
 
 def _rebuild_search_index() -> None:
     """Rebuild the TF-IDF search index from stored chunks."""
-    global _search_vectorizer, _search_matrix, _search_chunk_ids
-
     if not _chunk_index:
-        _search_vectorizer = None
-        _search_matrix = None
-        _search_chunk_ids = []
-        return
-
-    try:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-    except ImportError:
-        # scikit-learn not available — search disabled
-        _search_vectorizer = None
-        _search_matrix = None
-        _search_chunk_ids = []
+        _search_index.vectorizer = None
+        _search_index.matrix = None
+        _search_index.chunk_ids = []
         return
 
     # Collect compressed content from chunk files
@@ -157,9 +157,9 @@ def _rebuild_search_index() -> None:
             continue
 
     if not corpus:
-        _search_vectorizer = None
-        _search_matrix = None
-        _search_chunk_ids = []
+        _search_index.vectorizer = None
+        _search_index.matrix = None
+        _search_index.chunk_ids = []
         return
 
     vectorizer = TfidfVectorizer(
@@ -169,9 +169,9 @@ def _rebuild_search_index() -> None:
     )
     matrix = vectorizer.fit_transform(corpus)
 
-    _search_vectorizer = vectorizer
-    _search_matrix = matrix
-    _search_chunk_ids = chunk_ids
+    _search_index.vectorizer = vectorizer
+    _search_index.matrix = matrix
+    _search_index.chunk_ids = chunk_ids
 
 
 def _section_summaries_to_dicts(
@@ -201,7 +201,6 @@ def _interleave_results(
         return results
 
     # Round-robin interleave by cycling through source files
-    from itertools import zip_longest
 
     # Group by source
     by_source: dict[str, list[dict]] = {}
@@ -246,8 +245,6 @@ async def compress_pages(
             so the model receives mixed compressed/fresh conditioning (LCLM-style).
         preserve_entities: Always preserve named entities and key facts (default: true).
     """
-    global _chunk_index
-
     # Clamp ratio
     ratio = max(1.0, min(16.0, ratio))
 
@@ -375,8 +372,6 @@ async def compress_text(
         persist: If true, save the compressed chunk to disk for later retrieval.
         label: A label for this chunk (used as source_path if persisted).
     """
-    global _chunk_index
-
     ratio = max(1.0, min(16.0, ratio))
     compressor = Compressor(ratio=ratio, preserve_entities=preserve_entities)
     result: CompressionResult = compressor.compress(text)
@@ -444,7 +439,10 @@ async def expand_chunk(chunk_id: str) -> str:
     if not chunk_path.exists():
         if chunk_id in _chunk_index:
             return json.dumps({
-                "error": f"Chunk file missing for {chunk_id}. Manifest entry exists but file was deleted.",
+                "error": (
+                    f"Chunk file missing for {chunk_id}. "
+                    "Manifest entry exists but file was deleted."
+                ),
                 "metadata": _chunk_index[chunk_id],
             }, indent=2)
         return json.dumps({"error": f"Chunk not found: {chunk_id}"}, indent=2)
@@ -492,16 +490,14 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
         query: Search query text.
         top_k: Maximum number of results to return (default: 5).
     """
-    if _search_vectorizer is None or _search_matrix is None:
+    if _search_index.vectorizer is None or _search_index.matrix is None:
         return json.dumps({
             "error": "Search index not available. Compress some content first.",
             "results": [],
         }, indent=2)
 
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    query_vec = _search_vectorizer.transform([query])
-    similarities = cosine_similarity(query_vec, _search_matrix).flatten()
+    query_vec = _search_index.vectorizer.transform([query])
+    similarities = cosine_similarity(query_vec, _search_index.matrix).flatten()
 
     # Get top-k indices
     top_indices = similarities.argsort()[::-1][:top_k]
@@ -512,7 +508,7 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
         if score < 0.01:
             continue  # skip negligible matches
 
-        cid = _search_chunk_ids[idx]
+        cid = _search_index.chunk_ids[idx]
         meta = _chunk_index.get(cid, {})
 
         # Load compressed preview
@@ -631,8 +627,6 @@ async def purge_stale(dry_run: bool = True) -> str:
         dry_run: If true (default), report which chunks would be purged
             without actually deleting them. Set to false to delete.
     """
-    global _chunk_index
-
     stale: list[dict] = []
     for cid, meta in list(_chunk_index.items()):
         if _check_staleness(meta):
@@ -678,8 +672,7 @@ async def purge_stale(dry_run: bool = True) -> str:
 def main() -> None:
     """Start the context-compressor MCP server."""
     # Load manifest on startup
-    global _chunk_index
-    _chunk_index = _load_manifest()
+    _chunk_index.update(_load_manifest())
 
     # Build search index from existing chunks
     _rebuild_search_index()

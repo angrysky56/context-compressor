@@ -314,9 +314,9 @@ class TestSearchChunks:
     async def test_search_no_index(self) -> None:
         import context_compressor.server as srv
         # Ensure search index is empty for this test
-        srv._search_vectorizer = None
-        srv._search_matrix = None
-        srv._search_chunk_ids = []
+        srv._search_index.vectorizer = None
+        srv._search_index.matrix = None
+        srv._search_index.chunk_ids = []
 
         result = json.loads(await search_chunks(query="test"))
         assert result.get("error") or result.get("results") == []

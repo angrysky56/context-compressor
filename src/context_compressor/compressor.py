@@ -164,7 +164,9 @@ def parse_blocks(text: str) -> list[ContentBlock]:
             return
 
         # Check if this is a list block
-        list_lines = [l for l in current_paragraph_lines if _LIST_ITEM_RE.match(l)]
+        list_lines = [
+            item for item in current_paragraph_lines if _LIST_ITEM_RE.match(item)
+        ]
         if len(list_lines) > len(current_paragraph_lines) * 0.5:
             blocks.append(ContentBlock(
                 type=BlockType.LIST,
@@ -196,10 +198,15 @@ def parse_blocks(text: str) -> list[ContentBlock]:
             i += 1
             while i < len(lines):
                 code_lines.append(lines[i])
-                if lines[i].strip().startswith(fence_marker[0] * len(fence_marker)):
+                if lines[i].strip().startswith(
+                    fence_marker[0] * len(fence_marker)
+                ):
                     # Check it's a closing fence (same or more chars)
                     closing = lines[i].strip()
-                    if closing == fence_marker[0] * len(closing) and len(closing) >= len(fence_marker):
+                    if (
+                        closing == fence_marker[0] * len(closing)
+                        and len(closing) >= len(fence_marker)
+                    ):
                         i += 1
                         break
                 i += 1
@@ -215,7 +222,6 @@ def parse_blocks(text: str) -> list[ContentBlock]:
         if heading_match:
             flush_paragraph()
             level = len(heading_match.group(1))
-            title = heading_match.group(2).strip()
             # Higher weight for higher-level headings
             weight = 2.0 + (6 - level) * 0.3
             blocks.append(ContentBlock(
