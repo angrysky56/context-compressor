@@ -1,14 +1,8 @@
 """Tests for the context-compressor extractive compression engine."""
 
-import pytest
-
 from context_compressor.compressor import (
     BlockType,
     Compressor,
-    CompressionResult,
-    ContentBlock,
-    DEFAULT_IMPORTANT_TERMS,
-    SectionSummary,
     estimate_tokens,
     extract_entities,
     parse_blocks,

@@ -15,19 +15,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
-
 from itertools import zip_longest
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from .compressor import (
-    Compressor,
     CompressionResult,
+    Compressor,
     SectionSummary,
 )
+
+# ---------------------------------------------------------------------------
+# Logging — stderr only (stdout is the JSON-RPC channel for stdio MCP)
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("context_compressor")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -49,59 +60,171 @@ CHUNK_STORE.mkdir(parents=True, exist_ok=True)
 # Manifest file tracks all chunks
 MANIFEST_PATH = CHUNK_STORE / "manifest.json"
 
+# Embedding backend selection
+EMBED_BACKEND = os.getenv("EMBED_BACKEND", "local")  # "local" or "openrouter"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+
 # ---------------------------------------------------------------------------
 # In-memory chunk index (loaded from disk on startup)
 # ---------------------------------------------------------------------------
 _chunk_index: dict[str, dict] = {}
 
 
-class EmbeddingSearchIndex:
-    """In-memory embedding search index using Qwen3-Embedding-0.6B.
+class TfidfSearchIndex:
+    """TF-IDF fallback search index.
 
-    Uses real sentence embeddings instead of TF-IDF for semantic search.
-    The embedding model is lazy-loaded on first use.
+    Used when the embedding model is unavailable. Provides the same
+    `search(query, top_k)` interface as EmbeddingSearchIndex.
+    """
+
+    def __init__(self) -> None:
+        self._corpus: list[str] = []
+        self._chunk_ids: list[str] = []
+        self._tfidf_matrix = None
+        self._vocabulary: dict[str, int] = {}
+        self._loaded = False
+
+    def build(self, corpus: list[str], chunk_ids: list[str]) -> None:
+        """Build TF-IDF matrix from corpus texts."""
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        self._corpus = corpus
+        self._chunk_ids = chunk_ids
+        if not corpus:
+            self._loaded = True
+            return
+
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            max_features=10000,
+        )
+        self._tfidf_matrix = vectorizer.fit_transform(corpus)
+        self._vocabulary = vectorizer.vocabulary_
+        self._loaded = True
+
+    def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
+        """Search for the top-k most similar chunks to the query.
+
+        Returns list of (chunk_id, similarity_score) tuples.
+        """
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        if not self._loaded or not self._chunk_ids:
+            return []
+
+        # Rebuild a vectorizer with the same vocabulary for query transform
+        vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            vocabulary=self._vocabulary,
+        )
+        # Fit on empty to set up, then transform query
+        vectorizer.fit(self._corpus)
+        query_vec = vectorizer.transform([query])
+
+        # Cosine similarity via dot product (TF-IDF vectors are L2-normalized by sklearn)
+        similarities = (self._tfidf_matrix @ query_vec.T).toarray().flatten()
+
+        top_indices = similarities.argsort()[::-1][:top_k]
+
+        results = []
+        for idx in top_indices:
+            score = float(similarities[idx])
+            if score < 0.01:
+                continue
+            results.append((self._chunk_ids[idx], score))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def clear(self) -> None:
+        self._corpus = []
+        self._chunk_ids = []
+        self._tfidf_matrix = None
+        self._vocabulary = {}
+        self._loaded = False
+
+
+class EmbeddingBackend:
+    """Abstract embedding backend interface."""
+
+    def embed_texts(
+        self, texts: list[str], is_query: bool = False
+    ) -> list[list[float]]:
+        raise NotImplementedError
+
+
+class LocalEmbeddingBackend(EmbeddingBackend):
+    """Local Qwen3-Embedding backend using transformers.
+
+    Follows the Qwen3-Embedding-0.6B model card:
+    - Left padding for batch tokenization
+    - Last-token (EOS) pooling: take hidden state of last non-pad token
+    - Instruction-prefixed queries for retrieval
+    - bfloat16 on CUDA, float32 on CPU
     """
 
     def __init__(self) -> None:
         self.model = None
         self.tokenizer = None
-        self.embedding_matrix: list[list[float]] = []
-        self.chunk_ids: list[str] = []
+        self._model_name = EMBED_MODEL
         self._loaded = False
 
-    def _load_model(self):
-        """Lazy-load the Qwen3-Embedding model."""
+    def _load(self) -> None:
         if self._loaded:
             return
 
+        import torch
         from transformers import AutoModel, AutoTokenizer
 
-        model_name = os.getenv(
-            "EMBED_MODEL", "Qwen/Qwen3-Embedding-0.6B"
+        self.tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+        # Left padding as required by Qwen3-Embedding
+        self.tokenizer.padding_side = "left"
+
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        self.model = AutoModel.from_pretrained(
+            self._model_name,
+            torch_dtype=dtype,
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
         self.model.eval()
 
-        # Use GPU if available
-        import torch
         if torch.cuda.is_available():
             self.model = self.model.cuda()
 
         self._loaded = True
+        logger.info("Loaded embedding model: %s (dtype=%s)", self._model_name, dtype)
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a list of texts. Returns list of embedding vectors."""
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def embed_texts(
+        self, texts: list[str], is_query: bool = False
+    ) -> list[list[float]]:
+        """Embed a list of texts. Returns list of embedding vectors.
+
+        Args:
+            texts: Texts to embed.
+            is_query: If True, prepend the instruction prefix required by
+                Qwen3-Embedding for retrieval queries.
+        """
         import torch
 
-        self._load_model()
+        self._load()
 
-        # Tokenize
+        # Apply instruction prefix for queries per model card
+        if is_query:
+            prefix = "Instruct: Given a web search query, retrieve relevant passages\nQuery: "
+            texts = [f"{prefix}{t}" for t in texts]
+
+        # Tokenize with left padding
         inputs = self.tokenizer(
             texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=4096,
             return_tensors="pt",
         )
         if torch.cuda.is_available():
@@ -110,64 +233,169 @@ class EmbeddingSearchIndex:
         # Forward pass
         with torch.no_grad():
             outputs = self.model(**inputs)
-            # Use mean pooling over token embeddings
-            embeddings = outputs.last_hidden_state
-            attention_mask = inputs["attention_mask"].unsqueeze(-1)
-            masked = embeddings * attention_mask
-            summed = masked.sum(dim=1)
-            counts = attention_mask.sum(dim=1).clamp(min=1e-9)
-            embeddings = summed / counts
+            # Last-token pooling: with left padding, last non-pad is at position -1
+            embeddings = outputs.last_hidden_state[:, -1]
 
         # Normalize to unit vectors for cosine similarity
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
 
         return embeddings.cpu().tolist()
 
+
+class OpenRouterEmbeddingBackend(EmbeddingBackend):
+    """OpenRouter embedding backend.
+
+    POSTs to OpenRouter's embeddings endpoint. Falls back to TF-IDF
+    on network errors.
+    """
+
+    def __init__(self) -> None:
+        self._model_name = "nvidia/llama-nemotron-embed-vl-1b-v2:free"
+        self._api_key = OPENROUTER_API_KEY
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def embed_texts(
+        self, texts: list[str], is_query: bool = False
+    ) -> list[list[float]]:
+        """Embed texts via OpenRouter API.
+
+        OpenRouter doesn't use instruction prefixes, so is_query is ignored.
+        """
+        import json as _json
+
+        url = "https://openrouter.ai/api/v1/embeddings"
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        results = []
+        # OpenRouter may have batch limits; send one at a time to be safe
+        for text in texts:
+            payload = _json.dumps(
+                {
+                    "model": self._model_name,
+                    "input": text,
+                }
+            ).encode("utf-8")
+
+            req = urllib.request.Request(url, data=payload, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = _json.loads(resp.read().decode("utf-8"))
+                    embedding = data["data"][0]["embedding"]
+                    results.append(embedding)
+            except (
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                KeyError,
+                IndexError,
+            ) as e:
+                logger.error("OpenRouter embedding failed for text: %s", e)
+                raise
+
+        # Normalize
+        import numpy as np
+
+        arr = np.array(results)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        arr = arr / norms
+        return arr.tolist()
+
+
+class EmbeddingSearchIndex:
+    """In-memory embedding search index.
+
+    Supports pluggable backends (local Qwen3-Embedding or OpenRouter).
+    Falls back to TF-IDF when the embedding backend fails.
+    Tracks index status so callers can distinguish "no matches" from "search is broken".
+    """
+
+    def __init__(self) -> None:
+        self.backend: EmbeddingBackend | None = None
+        self.embedding_matrix: list[list[float]] = []
+        self.chunk_ids: list[str] = []
+        self.tfidf_index = TfidfSearchIndex()
+        self._status = "unavailable"
+        self._active_model = ""
+
+    @property
+    def status(self) -> str:
+        return self._status
+
+    def _create_backend(self) -> EmbeddingBackend:
+        if EMBED_BACKEND == "openrouter":
+            return OpenRouterEmbeddingBackend()
+        return LocalEmbeddingBackend()
+
+    def embed_texts(
+        self, texts: list[str], is_query: bool = False
+    ) -> list[list[float]]:
+        """Embed a list of texts. Returns list of embedding vectors."""
+        if self.backend is None:
+            self.backend = self._create_backend()
+        return self.backend.embed_texts(texts, is_query=is_query)
+
+    @property
+    def _model_name(self) -> str:
+        if self.backend is not None:
+            return self.backend.model_name
+        return EMBED_MODEL
+
     def search(self, query: str, top_k: int = 5) -> list[tuple[str, float]]:
         """Search for the top-k most similar chunks to the query.
 
         Returns list of (chunk_id, similarity_score) tuples.
         """
-        import torch
         import numpy as np
 
         if not self.embedding_matrix or not self.chunk_ids:
             return []
 
-        # Embed the query
-        query_embedding = self.embed_texts([query])[0]
-        query_vec = np.array(query_embedding)
+        # Embed the query with instruction prefix
+        try:
+            query_embedding = self.embed_texts([query], is_query=True)[0]
+        except Exception as e:
+            logger.error("Query embedding failed: %s", e)
+            # Fall back to TF-IDF
+            return self.tfidf_index.search(query, top_k)
 
-        # Compute cosine similarities (embeddings are already normalized)
+        query_vec = np.array(query_embedding)
         matrix = np.array(self.embedding_matrix)
         similarities = matrix @ query_vec  # dot product = cosine for unit vectors
 
-        # Get top-k
         top_indices = similarities.argsort()[::-1][:top_k]
 
         results = []
         for idx in top_indices:
             score = float(similarities[idx])
-            if score < 0.1:
+            if score < 0.01:
                 continue  # skip very low similarity
             results.append((self.chunk_ids[idx], score))
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results
 
-    def clear(self):
-        """Clear the index."""
+    def clear(self) -> None:
+        """Clear the embedding index (but not the backend model)."""
         self.embedding_matrix = []
         self.chunk_ids = []
+        self.tfidf_index.clear()
 
-    def unload(self):
+    def unload(self) -> None:
         """Free model memory."""
-        self.model = None
-        self.tokenizer = None
-        self._loaded = False
+        self.backend = None
+        self._status = "unavailable"
+        self._active_model = ""
         self.clear()
         try:
             import torch
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except ImportError:
@@ -240,15 +468,28 @@ def _check_staleness(meta: dict) -> bool:
 
 
 def _rebuild_search_index() -> None:
-    """Rebuild the embedding search index from stored chunks."""
+    """Rebuild the embedding search index from stored chunks.
+
+    Loads existing embeddings from chunk JSONs. Only embeds chunks that
+    are missing a vector or whose embedding_model differs from the active model.
+    Falls back to TF-IDF if the embedding backend fails.
+    """
     _search_index.clear()
 
     if not _chunk_index:
+        _search_index._status = "ready"
+        logger.info("No chunks to index")
         return
 
-    # Collect compressed content from chunk files
-    corpus: list[str] = []
-    chunk_ids: list[str] = []
+    # Collect compressed content and existing embeddings from chunk files
+    texts_to_embed: list[str] = []
+    ids_to_embed: list[str] = []
+    existing_embeddings: list[list[float]] = []
+    existing_ids: list[str] = []
+    all_corpus: list[str] = []
+    all_chunk_ids: list[str] = []
+
+    active_model = _search_index._model_name
 
     for cid in _chunk_index:
         chunk_path = CHUNK_STORE / f"{cid}.json"
@@ -257,23 +498,87 @@ def _rebuild_search_index() -> None:
         try:
             data = json.loads(chunk_path.read_text())
             compressed = data.get("compressed_content", "")
-            if compressed:
-                corpus.append(compressed)
-                chunk_ids.append(cid)
-        except (json.JSONDecodeError, OSError):
+            if not compressed:
+                continue
+            all_corpus.append(compressed)
+            all_chunk_ids.append(cid)
+
+            # Check if we can reuse a stored embedding
+            stored_model = data.get("embedding_model", "")
+            stored_embedding = data.get("embedding", [])
+            if stored_embedding and stored_model == active_model:
+                existing_embeddings.append(stored_embedding)
+                existing_ids.append(cid)
+            else:
+                texts_to_embed.append(compressed)
+                ids_to_embed.append(cid)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Failed to read chunk %s: %s", cid, e)
             continue
 
-    if not corpus:
+    if not all_corpus:
+        _search_index._status = "ready"
+        logger.info("No corpus to index")
         return
 
-    # Batch embed all compressed chunks
-    try:
-        embeddings = _search_index.embed_texts(corpus)
-        _search_index.embedding_matrix = embeddings
-        _search_index.chunk_ids = chunk_ids
-    except Exception as e:
-        # If embedding fails (e.g., model not available), search will return empty
-        pass
+    # Always build TF-IDF as a fallback
+    _search_index.tfidf_index.build(all_corpus, all_chunk_ids)
+
+    # Embed only the chunks that need it
+    if texts_to_embed:
+        logger.info(
+            "Embedding %d new/changed chunks (reusing %d existing)",
+            len(texts_to_embed),
+            len(existing_embeddings),
+        )
+        try:
+            # Batch embed at most 16 texts per forward pass
+            batch_size = 16
+            new_embeddings: list[list[float]] = []
+            for i in range(0, len(texts_to_embed), batch_size):
+                batch = texts_to_embed[i : i + batch_size]
+                batch_embeddings = _search_index.embed_texts(batch, is_query=False)
+                new_embeddings.extend(batch_embeddings)
+
+            # Merge existing + new, preserving chunk_id order
+            emb_map: dict[str, list[float]] = {}
+            for cid, emb in zip(existing_ids, existing_embeddings, strict=False):
+                emb_map[cid] = emb
+            for cid, emb in zip(ids_to_embed, new_embeddings, strict=False):
+                emb_map[cid] = emb
+
+            # Store embeddings back into chunk JSONs
+            for cid in all_chunk_ids:
+                chunk_path = CHUNK_STORE / f"{cid}.json"
+                try:
+                    data = json.loads(chunk_path.read_text())
+                    data["embedding"] = emb_map[cid]
+                    data["embedding_model"] = active_model
+                    data["embedding_dim"] = len(emb_map[cid])
+                    chunk_path.write_text(json.dumps(data, indent=2))
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning("Failed to save embedding for chunk %s: %s", cid, e)
+
+            # Build the matrix in consistent order
+            ordered_ids = list(all_chunk_ids)
+            ordered_embeddings = [emb_map[cid] for cid in ordered_ids if cid in emb_map]
+            _search_index.embedding_matrix = ordered_embeddings
+            _search_index.chunk_ids = ordered_ids
+            _search_index._status = "ready"
+            _search_index._active_model = active_model
+            logger.info("Embedding index rebuilt: %d chunks", len(ordered_ids))
+        except Exception as e:
+            logger.error("Embedding model failed, falling back to TF-IDF: %s", e)
+            _search_index.embedding_matrix = []
+            _search_index.chunk_ids = []
+            _search_index._status = "fallback_tfidf"
+    else:
+        # All embeddings were reused from disk
+        _search_index.embedding_matrix = existing_embeddings
+        _search_index.chunk_ids = existing_ids
+        _search_index._status = "ready"
+        _search_index._active_model = active_model
+        logger.info("Embedding index loaded from disk: %d chunks", len(existing_ids))
 
 
 def _section_summaries_to_dicts(
@@ -356,10 +661,12 @@ async def compress_pages(
     for path_str in paths:
         path = Path(path_str)
         if not path.exists():
-            results.append({
-                "path": path_str,
-                "error": f"File not found: {path_str}",
-            })
+            results.append(
+                {
+                    "path": path_str,
+                    "error": f"File not found: {path_str}",
+                }
+            )
             continue
 
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -370,17 +677,19 @@ async def compress_pages(
         existing_cid = _find_existing_chunk(resolved, chash, ratio)
         if existing_cid:
             meta = _chunk_index[existing_cid]
-            results.append({
-                "chunk_id": existing_cid,
-                "source_path": path_str,
-                "ratio": ratio,
-                "actual_ratio": meta.get("actual_ratio", ratio),
-                "original_tokens": meta.get("original_tokens", 0),
-                "compressed_tokens": meta.get("compressed_tokens", 0),
-                "key_entities": meta.get("key_entities", []),
-                "confidence": meta.get("confidence", 0.0),
-                "deduplicated": True,
-            })
+            results.append(
+                {
+                    "chunk_id": existing_cid,
+                    "source_path": path_str,
+                    "ratio": ratio,
+                    "actual_ratio": meta.get("actual_ratio", ratio),
+                    "original_tokens": meta.get("original_tokens", 0),
+                    "compressed_tokens": meta.get("compressed_tokens", 0),
+                    "key_entities": meta.get("key_entities", []),
+                    "confidence": meta.get("confidence", 0.0),
+                    "deduplicated": True,
+                }
+            )
             continue
 
         # --- Compress ---
@@ -409,32 +718,39 @@ async def compress_pages(
 
         # Persist compressed chunk to disk
         chunk_path = CHUNK_STORE / f"{cid}.json"
-        chunk_path.write_text(json.dumps({
-            "metadata": metadata,
-            "compressed_content": compression_result.compressed_text,
-            "original_content": content,  # stored for expand; Phase 2 will drop this
-        }, indent=2))
+        chunk_path.write_text(
+            json.dumps(
+                {
+                    "metadata": metadata,
+                    "compressed_content": compression_result.compressed_text,
+                    "original_content": content,  # stored for expand; Phase 2 will drop this
+                },
+                indent=2,
+            )
+        )
 
         # Update manifest
         _chunk_index[cid] = metadata
         _save_manifest(_chunk_index)
 
-        results.append({
-            "chunk_id": cid,
-            "source_path": path_str,
-            "ratio": ratio,
-            "actual_ratio": compression_result.actual_ratio,
-            "original_tokens": compression_result.original_tokens,
-            "compressed_tokens": compression_result.compressed_tokens,
-            "key_entities": compression_result.key_entities,
-            "confidence": compression_result.confidence,
-            "sections": [s.title for s in compression_result.sections],
-            "compressed_preview": (
-                compression_result.compressed_text[:300] + "..."
-                if len(compression_result.compressed_text) > 300
-                else compression_result.compressed_text
-            ),
-        })
+        results.append(
+            {
+                "chunk_id": cid,
+                "source_path": path_str,
+                "ratio": ratio,
+                "actual_ratio": compression_result.actual_ratio,
+                "original_tokens": compression_result.original_tokens,
+                "compressed_tokens": compression_result.compressed_tokens,
+                "key_entities": compression_result.key_entities,
+                "confidence": compression_result.confidence,
+                "sections": [s.title for s in compression_result.sections],
+                "compressed_preview": (
+                    compression_result.compressed_text[:300] + "..."
+                    if len(compression_result.compressed_text) > 300
+                    else compression_result.compressed_text
+                ),
+            }
+        )
 
     # Rebuild search index with new chunks
     _rebuild_search_index()
@@ -510,11 +826,16 @@ async def compress_text(
         }
 
         chunk_path = CHUNK_STORE / f"{cid}.json"
-        chunk_path.write_text(json.dumps({
-            "metadata": metadata,
-            "compressed_content": result.compressed_text,
-            "original_content": text,
-        }, indent=2))
+        chunk_path.write_text(
+            json.dumps(
+                {
+                    "metadata": metadata,
+                    "compressed_content": result.compressed_text,
+                    "original_content": text,
+                },
+                indent=2,
+            )
+        )
 
         _chunk_index[cid] = metadata
         _save_manifest(_chunk_index)
@@ -540,25 +861,31 @@ async def expand_chunk(chunk_id: str) -> str:
 
     if not chunk_path.exists():
         if chunk_id in _chunk_index:
-            return json.dumps({
-                "error": (
-                    f"Chunk file missing for {chunk_id}. "
-                    "Manifest entry exists but file was deleted."
-                ),
-                "metadata": _chunk_index[chunk_id],
-            }, indent=2)
+            return json.dumps(
+                {
+                    "error": (
+                        f"Chunk file missing for {chunk_id}. "
+                        "Manifest entry exists but file was deleted."
+                    ),
+                    "metadata": _chunk_index[chunk_id],
+                },
+                indent=2,
+            )
         return json.dumps({"error": f"Chunk not found: {chunk_id}"}, indent=2)
 
     chunk_data = json.loads(chunk_path.read_text())
     original_content = chunk_data["original_content"]
     metadata = chunk_data["metadata"]
 
-    return json.dumps({
-        "chunk_id": chunk_id,
-        "source_path": metadata["source_path"],
-        "original_tokens": metadata["original_tokens"],
-        "content": original_content,
-    }, indent=2)
+    return json.dumps(
+        {
+            "chunk_id": chunk_id,
+            "source_path": metadata["source_path"],
+            "original_tokens": metadata["original_tokens"],
+            "content": original_content,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -584,8 +911,9 @@ async def get_chunk_metadata(chunk_id: str) -> str:
 async def search_chunks(query: str, top_k: int = 5) -> str:
     """Semantic search across compressed chunks by query.
 
-    Uses Qwen3-Embedding-0.6B for real embedding similarity (not TF-IDF).
-    Returns ranked results with relevance scores, chunk IDs, source paths,
+    Uses the configured embedding backend (local Qwen3-Embedding-0.6B or OpenRouter)
+    for real embedding similarity. Falls back to TF-IDF if the embedding backend
+    is unavailable. Returns ranked results with relevance scores, chunk IDs, source paths,
     and compressed previews.
 
     Args:
@@ -593,14 +921,23 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
         top_k: Maximum number of results to return (default: 5).
     """
     results = _search_index.search(query, top_k)
+    index_status = _search_index.status
 
     if not results:
-        return json.dumps({
-            "query": query,
-            "returned": 0,
-            "results": [],
-            "message": "No results. Compress some content first, or the embedding model may not be available.",
-        }, indent=2)
+        return json.dumps(
+            {
+                "query": query,
+                "returned": 0,
+                "results": [],
+                "index_status": index_status,
+                "message": (
+                    "No results. Compress some content first."
+                    if index_status == "ready"
+                    else f"Search index status: {index_status}. Compress some content or check embedding backend."
+                ),
+            },
+            indent=2,
+        )
 
     output_results = []
     for cid, score in results:
@@ -613,26 +950,34 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
             try:
                 data = json.loads(chunk_path.read_text())
                 compressed = data.get("compressed_content", "")
-                preview = compressed[:300] + "..." if len(compressed) > 300 else compressed
+                preview = (
+                    compressed[:300] + "..." if len(compressed) > 300 else compressed
+                )
             except (json.JSONDecodeError, OSError):
                 pass
 
-        output_results.append({
-            "chunk_id": cid,
-            "relevance_score": round(score, 4),
-            "source_path": meta.get("source_path", ""),
-            "key_entities": meta.get("key_entities", []),
-            "original_tokens": meta.get("original_tokens", 0),
-            "compressed_tokens": meta.get("compressed_tokens", 0),
-            "confidence": meta.get("confidence", 0.0),
-            "compressed_preview": preview,
-        })
+        output_results.append(
+            {
+                "chunk_id": cid,
+                "relevance_score": round(score, 4),
+                "source_path": meta.get("source_path", ""),
+                "key_entities": meta.get("key_entities", []),
+                "original_tokens": meta.get("original_tokens", 0),
+                "compressed_tokens": meta.get("compressed_tokens", 0),
+                "confidence": meta.get("confidence", 0.0),
+                "compressed_preview": preview,
+            }
+        )
 
-    return json.dumps({
-        "query": query,
-        "returned": len(output_results),
-        "results": output_results,
-    }, indent=2)
+    return json.dumps(
+        {
+            "query": query,
+            "returned": len(output_results),
+            "index_status": index_status,
+            "results": output_results,
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -651,19 +996,21 @@ async def list_chunks(
     chunks = list(_chunk_index.values())
 
     if source_prefix:
-        chunks = [
-            c for c in chunks if c["source_path"].startswith(source_prefix)
-        ]
+        chunks = [c for c in chunks if c["source_path"].startswith(source_prefix)]
 
     # Sort by creation time, newest first
     chunks.sort(key=lambda c: c.get("created_at", ""), reverse=True)
     chunks = chunks[:limit]
 
-    return json.dumps({
-        "total": len(_chunk_index),
-        "returned": len(chunks),
-        "chunks": chunks,
-    }, indent=2, default=str)
+    return json.dumps(
+        {
+            "total": len(_chunk_index),
+            "returned": len(chunks),
+            "chunks": chunks,
+        },
+        indent=2,
+        default=str,
+    )
 
 
 @mcp.tool()
@@ -675,43 +1022,41 @@ async def compression_stats() -> str:
     """
     total_chunks = len(_chunk_index)
     if total_chunks == 0:
-        return json.dumps({
-            "total_chunks": 0,
-            "message": "No chunks compressed yet.",
-        }, indent=2)
+        return json.dumps(
+            {
+                "total_chunks": 0,
+                "message": "No chunks compressed yet.",
+            },
+            indent=2,
+        )
 
-    total_original = sum(
-        c.get("original_tokens", 0) for c in _chunk_index.values()
-    )
-    total_compressed = sum(
-        c.get("compressed_tokens", 0) for c in _chunk_index.values()
-    )
+    total_original = sum(c.get("original_tokens", 0) for c in _chunk_index.values())
+    total_compressed = sum(c.get("compressed_tokens", 0) for c in _chunk_index.values())
     avg_ratio = (
-        sum(c.get("actual_ratio", 0) for c in _chunk_index.values())
-        / total_chunks
+        sum(c.get("actual_ratio", 0) for c in _chunk_index.values()) / total_chunks
     )
     avg_confidence = (
-        sum(c.get("confidence", 0) for c in _chunk_index.values())
-        / total_chunks
+        sum(c.get("confidence", 0) for c in _chunk_index.values()) / total_chunks
     )
-    unique_sources = len(
-        set(c["source_path"] for c in _chunk_index.values())
-    )
+    unique_sources = len(set(c["source_path"] for c in _chunk_index.values()))
 
     # Count stale chunks
     stale_count = sum(1 for c in _chunk_index.values() if _check_staleness(c))
 
-    return json.dumps({
-        "total_chunks": total_chunks,
-        "unique_sources": unique_sources,
-        "total_original_tokens": total_original,
-        "total_compressed_tokens": total_compressed,
-        "tokens_saved": total_original - total_compressed,
-        "avg_compression_ratio": round(avg_ratio, 2),
-        "avg_confidence": round(avg_confidence, 3),
-        "stale_chunks": stale_count,
-        "store_path": str(CHUNK_STORE),
-    }, indent=2)
+    return json.dumps(
+        {
+            "total_chunks": total_chunks,
+            "unique_sources": unique_sources,
+            "total_original_tokens": total_original,
+            "total_compressed_tokens": total_compressed,
+            "tokens_saved": total_original - total_compressed,
+            "avg_compression_ratio": round(avg_ratio, 2),
+            "avg_confidence": round(avg_confidence, 3),
+            "stale_chunks": stale_count,
+            "store_path": str(CHUNK_STORE),
+        },
+        indent=2,
+    )
 
 
 @mcp.tool()
@@ -725,16 +1070,18 @@ async def purge_stale(dry_run: bool = True) -> str:
     stale: list[dict] = []
     for cid, meta in list(_chunk_index.items()):
         if _check_staleness(meta):
-            stale.append({
-                "chunk_id": cid,
-                "source_path": meta.get("source_path", ""),
-                "created_at": meta.get("created_at", ""),
-                "reason": (
-                    "source deleted"
-                    if not Path(meta.get("source_path", "")).exists()
-                    else "content changed"
-                ),
-            })
+            stale.append(
+                {
+                    "chunk_id": cid,
+                    "source_path": meta.get("source_path", ""),
+                    "created_at": meta.get("created_at", ""),
+                    "reason": (
+                        "source deleted"
+                        if not Path(meta.get("source_path", "")).exists()
+                        else "content changed"
+                    ),
+                }
+            )
 
     if not dry_run:
         for entry in stale:
@@ -749,16 +1096,19 @@ async def purge_stale(dry_run: bool = True) -> str:
         _save_manifest(_chunk_index)
         _rebuild_search_index()
 
-    return json.dumps({
-        "dry_run": dry_run,
-        "stale_count": len(stale),
-        "stale_chunks": stale,
-        "message": (
-            f"Would purge {len(stale)} stale chunk(s)."
-            if dry_run
-            else f"Purged {len(stale)} stale chunk(s)."
-        ),
-    }, indent=2)
+    return json.dumps(
+        {
+            "dry_run": dry_run,
+            "stale_count": len(stale),
+            "stale_chunks": stale,
+            "message": (
+                f"Would purge {len(stale)} stale chunk(s)."
+                if dry_run
+                else f"Purged {len(stale)} stale chunk(s)."
+            ),
+        },
+        indent=2,
+    )
 
 
 # ---------------------------------------------------------------------------

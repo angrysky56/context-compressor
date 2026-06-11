@@ -1,24 +1,15 @@
 """Tests for the context-compressor MCP server tools."""
 
 import json
-import os
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
 from context_compressor.server import (
     _chunk_id,
     _content_hash,
-    _find_existing_chunk,
-    _check_staleness,
     _section_summaries_to_dicts,
     _interleave_results,
-    _chunk_index,
-    _load_manifest,
-    _save_manifest,
-    _rebuild_search_index,
     compress_pages,
     compress_text,
     expand_chunk,
@@ -27,8 +18,6 @@ from context_compressor.server import (
     list_chunks,
     compression_stats,
     purge_stale,
-    CHUNK_STORE,
-    MANIFEST_PATH,
 )
 from context_compressor.compressor import SectionSummary
 

@@ -16,7 +16,8 @@ This server enables LLM agents to compress large wiki pages, long documents, or 
 - **Hierarchical Compression** — Sections are compressed independently; the document outline (all headings) is always preserved in the output.
 - **TF-IDF Sentence Scoring** — Ranks content blocks by information density with bonuses for entities, structural markers, and position.
 - **Entity Preservation** — Named entities and configurable domain-specific terms (e.g., `ELBO`, `PAC-Bayes`, `MCMC`) are prioritized during compression.
-- **Embedding Search** — Qwen3-Embedding-0.6B for real semantic similarity (not TF-IDF). Lazy-loaded on first search.
+- **Embedding Search** — Qwen3-Embedding-0.6B for real semantic similarity with last-token pooling and instruction-prefixed queries. Pluggable backend (local or OpenRouter). Automatic TF-IDF fallback when the embedding model is unavailable.
+- **Embedding Persistence** — Embeddings stored in chunk JSON with model metadata. On rebuild, only missing or model-mismatched chunks are re-embedded.
 - **Content-Hash Deduplication** — Re-compressing an unchanged file returns the existing chunk instantly.
 - **Staleness Detection** — Detects when source files have changed since compression and supports bulk purging.
 - **Inline Text Compression** — Compress text directly without needing a file on disk (conversation history, tool output, etc.).
@@ -27,13 +28,15 @@ This server enables LLM agents to compress large wiki pages, long documents, or 
 
 All 8 context-compressor tools tested ✓
 
+67 unit tests + 1 integration test (skipped unless `RUN_EMBED_TESTS=1`)
+
 | Tool               | Description                                                                          |
 | ------------------ | ------------------------------------------------------------------------------------ |
 | compress_pages     | Compresses wiki pages with deduplication, entity preservation, hierarchical sections |
 | compress_text      | Compresses inline text without file I/O                                              |
 | expand_chunk       | Restores original full-text from chunk ID                                            |
 | get_chunk_metadata | Returns ratio, entities, confidence, sections, staleness                             |
-| search_chunks      | TF-IDF semantic search across compressed chunks                                      |
+| search_chunks      | Embedding semantic search (local or OpenRouter) with TF-IDF fallback. Returns index_status so callers can detect degradation. |
 | list_chunks        | Lists chunks with source prefix filtering                                            |
 | compression_stats  | Global stats: tokens saved, avg ratio, stale count                                   |
 | purge_stale        | Dry-run and actual purge of stale chunks                                             |
@@ -72,6 +75,9 @@ uv run pytest tests/ -v
 | `NEO4J_USERNAME`           | `neo4j`                        | Neo4j username                            |
 | `NEO4J_PASSWORD`           | `00000000`                     | Neo4j password                            |
 | `NEO4J_DATABASE`           | `synapse`                      | Neo4j database name                       |
+| `EMBED_BACKEND`            | `local`                        | Embedding backend: `local` or `openrouter` |
+| `EMBED_MODEL`              | `Qwen/Qwen3-Embedding-0.6B`    | HuggingFace model ID (local backend only) |
+| `OPENROUTER_API_KEY`       | *(none)*                       | OpenRouter API key (openrouter backend)   |
 
 ---
 
@@ -145,7 +151,18 @@ Get metadata (ratio, entities, confidence, sections, staleness) without expandin
 
 ### `search_chunks`
 
-Semantic search across compressed chunks using TF-IDF similarity.
+Semantic search across compressed chunks using the configured embedding backend.
+
+**Backends:**
+- `local` (default) — Uses Qwen3-Embedding-0.6B via transformers with last-token pooling and instruction-prefixed queries. Loads on first use. Uses bfloat16 on CUDA, float32 on CPU.
+- `openrouter` — POSTs to OpenRouter's embeddings endpoint (`nvidia/llama-nemotron-embed-vl-1b-v2:free`). Requires `OPENROUTER_API_KEY`.
+
+**Fallback:** If the embedding backend fails (model load error, network failure), the system automatically falls back to TF-IDF search. The `index_status` field in the response indicates the current state:
+- `"ready"` — Embedding search is working
+- `"fallback_tfidf"` — Embedding backend failed; using TF-IDF
+- `"unavailable"` — No index built yet
+
+**Embedding persistence:** Embeddings are stored in chunk JSON files along with `embedding_model` and `embedding_dim`. On index rebuild, only chunks missing an embedding or produced by a different model are re-embedded.
 
 | Parameter | Type      | Default    | Description           |
 | --------- | --------- | ---------- | --------------------- |
