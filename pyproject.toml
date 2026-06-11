@@ -1,0 +1,23 @@
+[project]
+name = "context-compressor"
+version = "0.1.0"
+description = "MCP server for compressing and expanding agent context — LCLM-inspired latent chunk management"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",
+    "pyyaml>=6.0",
+    "neo4j>=5.0.0",
+    "pydantic>=2.0.0",
+    "scikit-learn>=1.0.0",
+    "numpy>=1.24.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+context-compressor = "context_compressor.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/context_compressor"]
