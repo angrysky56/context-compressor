@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -57,8 +58,80 @@ CHUNK_STORE = Path(
 )
 CHUNK_STORE.mkdir(parents=True, exist_ok=True)
 
-# Manifest file tracks all chunks
+# SQLite DB tracks all chunks
+DB_PATH = CHUNK_STORE / "chunks.db"
+
+# Legacy manifest file for migration
 MANIFEST_PATH = CHUNK_STORE / "manifest.json"
+
+
+def _init_db() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
+                metadata TEXT,
+                original_content TEXT,
+                compressed_content TEXT,
+                embedding TEXT,
+                embedding_model TEXT,
+                embedding_dim INTEGER
+            )
+        """)
+
+
+def _migrate_json_to_db() -> None:
+    if not MANIFEST_PATH.exists():
+        return
+
+    logger.info("Migrating existing JSON chunks to SQLite database...")
+    try:
+        old_index = json.loads(MANIFEST_PATH.read_text())
+    except Exception:
+        old_index = {}
+
+    with sqlite3.connect(DB_PATH) as conn:
+        for cid in old_index:
+            chunk_path = CHUNK_STORE / f"{cid}.json"
+            if not chunk_path.exists():
+                continue
+
+            try:
+                data = json.loads(chunk_path.read_text())
+                metadata = data.get("metadata", old_index[cid])
+                compressed = data.get("compressed_content", "")
+                original = data.get("original_content", "")
+                embedding = data.get("embedding", [])
+                embedding_model = data.get("embedding_model", "")
+                embedding_dim = data.get("embedding_dim", 0)
+
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO chunks
+                    (chunk_id, metadata, original_content, compressed_content, embedding, embedding_model, embedding_dim)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        cid,
+                        json.dumps(metadata),
+                        original,
+                        compressed,
+                        json.dumps(embedding) if embedding else None,
+                        embedding_model,
+                        embedding_dim,
+                    ),
+                )
+            except Exception as e:
+                logger.error("Failed to migrate chunk %s: %s", cid, e)
+            else:
+                chunk_path.unlink()
+
+    try:
+        MANIFEST_PATH.unlink()
+    except OSError:
+        pass
+    logger.info("Migration to SQLite completed.")
+
 
 # Embedding backend selection
 EMBED_BACKEND = os.getenv("EMBED_BACKEND", "local")  # "local" or "openrouter"
@@ -406,19 +479,37 @@ class EmbeddingSearchIndex:
 _search_index = EmbeddingSearchIndex()
 
 
-def _load_manifest() -> dict[str, dict]:
-    """Load chunk manifest from disk."""
-    if MANIFEST_PATH.exists():
+def _load_from_db() -> dict[str, dict]:
+    """Load chunk metadata index from SQLite DB."""
+    index = {}
+    if not DB_PATH.exists():
+        return index
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
         try:
-            return json.loads(MANIFEST_PATH.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+            cursor = conn.execute("SELECT chunk_id, metadata FROM chunks")
+            for row in cursor:
+                try:
+                    index[row["chunk_id"]] = json.loads(row["metadata"])
+                except json.JSONDecodeError:
+                    pass
+        except sqlite3.OperationalError:
+            pass  # DB might not be initialized yet
+    return index
 
 
-def _save_manifest(index: dict[str, dict]) -> None:
-    """Persist chunk manifest to disk."""
-    MANIFEST_PATH.write_text(json.dumps(index, indent=2, default=str))
+def _save_chunk_to_db(cid: str, metadata: dict, original: str, compressed: str) -> None:
+    """Persist a chunk to SQLite database."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO chunks
+            (chunk_id, metadata, original_content, compressed_content)
+            VALUES (?, ?, ?, ?)
+        """,
+            (cid, json.dumps(metadata), original, compressed),
+        )
 
 
 def _content_hash(content: str) -> str:
@@ -491,30 +582,42 @@ def _rebuild_search_index() -> None:
 
     active_model = _search_index._model_name
 
-    for cid in _chunk_index:
-        chunk_path = CHUNK_STORE / f"{cid}.json"
-        if not chunk_path.exists():
-            continue
-        try:
-            data = json.loads(chunk_path.read_text())
-            compressed = data.get("compressed_content", "")
-            if not compressed:
-                continue
-            all_corpus.append(compressed)
-            all_chunk_ids.append(cid)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        for cid in _chunk_index:
+            try:
+                row = conn.execute(
+                    "SELECT compressed_content, embedding, embedding_model FROM chunks WHERE chunk_id = ?",
+                    (cid,),
+                ).fetchone()
+                if not row:
+                    continue
 
-            # Check if we can reuse a stored embedding
-            stored_model = data.get("embedding_model", "")
-            stored_embedding = data.get("embedding", [])
-            if stored_embedding and stored_model == active_model:
-                existing_embeddings.append(stored_embedding)
-                existing_ids.append(cid)
-            else:
-                texts_to_embed.append(compressed)
-                ids_to_embed.append(cid)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("Failed to read chunk %s: %s", cid, e)
-            continue
+                compressed = row["compressed_content"]
+                if not compressed:
+                    continue
+                all_corpus.append(compressed)
+                all_chunk_ids.append(cid)
+
+                stored_model = row["embedding_model"]
+                stored_embedding_raw = row["embedding"]
+
+                try:
+                    stored_embedding = (
+                        json.loads(stored_embedding_raw) if stored_embedding_raw else []
+                    )
+                except Exception:
+                    stored_embedding = []
+
+                if stored_embedding and stored_model == active_model:
+                    existing_embeddings.append(stored_embedding)
+                    existing_ids.append(cid)
+                else:
+                    texts_to_embed.append(compressed)
+                    ids_to_embed.append(cid)
+            except Exception as e:
+                logger.warning("Failed to read chunk %s: %s", cid, e)
+                continue
 
     if not all_corpus:
         _search_index._status = "ready"
@@ -547,17 +650,27 @@ def _rebuild_search_index() -> None:
             for cid, emb in zip(ids_to_embed, new_embeddings, strict=False):
                 emb_map[cid] = emb
 
-            # Store embeddings back into chunk JSONs
-            for cid in all_chunk_ids:
-                chunk_path = CHUNK_STORE / f"{cid}.json"
-                try:
-                    data = json.loads(chunk_path.read_text())
-                    data["embedding"] = emb_map[cid]
-                    data["embedding_model"] = active_model
-                    data["embedding_dim"] = len(emb_map[cid])
-                    chunk_path.write_text(json.dumps(data, indent=2))
-                except (json.JSONDecodeError, OSError) as e:
-                    logger.warning("Failed to save embedding for chunk %s: %s", cid, e)
+            # Store embeddings back into chunks table
+            with sqlite3.connect(DB_PATH) as conn:
+                for cid in ids_to_embed:
+                    if cid in emb_map:
+                        try:
+                            conn.execute(
+                                """
+                                UPDATE chunks SET embedding = ?, embedding_model = ?, embedding_dim = ?
+                                WHERE chunk_id = ?
+                            """,
+                                (
+                                    json.dumps(emb_map[cid]),
+                                    active_model,
+                                    len(emb_map[cid]),
+                                    cid,
+                                ),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to save embedding for chunk %s: %s", cid, e
+                            )
 
             # Build the matrix in consistent order
             ordered_ids = list(all_chunk_ids)
@@ -716,22 +829,11 @@ async def compress_pages(
             "sections": _section_summaries_to_dicts(compression_result.sections),
         }
 
-        # Persist compressed chunk to disk
-        chunk_path = CHUNK_STORE / f"{cid}.json"
-        chunk_path.write_text(
-            json.dumps(
-                {
-                    "metadata": metadata,
-                    "compressed_content": compression_result.compressed_text,
-                    "original_content": content,  # stored for expand; Phase 2 will drop this
-                },
-                indent=2,
-            )
-        )
+        # Persist compressed chunk to DB
+        _save_chunk_to_db(cid, metadata, content, compression_result.compressed_text)
 
         # Update manifest
         _chunk_index[cid] = metadata
-        _save_manifest(_chunk_index)
 
         results.append(
             {
@@ -825,20 +927,8 @@ async def compress_text(
             "sections": _section_summaries_to_dicts(result.sections),
         }
 
-        chunk_path = CHUNK_STORE / f"{cid}.json"
-        chunk_path.write_text(
-            json.dumps(
-                {
-                    "metadata": metadata,
-                    "compressed_content": result.compressed_text,
-                    "original_content": text,
-                },
-                indent=2,
-            )
-        )
-
+        _save_chunk_to_db(cid, metadata, text, result.compressed_text)
         _chunk_index[cid] = metadata
-        _save_manifest(_chunk_index)
         _rebuild_search_index()
 
         output["chunk_id"] = cid
@@ -857,15 +947,20 @@ async def expand_chunk(chunk_id: str) -> str:
     Args:
         chunk_id: The chunk ID returned by compress_pages or compress_text.
     """
-    chunk_path = CHUNK_STORE / f"{chunk_id}.json"
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT original_content, metadata FROM chunks WHERE chunk_id = ?",
+            (chunk_id,),
+        ).fetchone()
 
-    if not chunk_path.exists():
+    if not row:
         if chunk_id in _chunk_index:
             return json.dumps(
                 {
                     "error": (
-                        f"Chunk file missing for {chunk_id}. "
-                        "Manifest entry exists but file was deleted."
+                        f"Chunk DB row missing for {chunk_id}. "
+                        "Manifest entry exists but row was deleted."
                     ),
                     "metadata": _chunk_index[chunk_id],
                 },
@@ -873,9 +968,8 @@ async def expand_chunk(chunk_id: str) -> str:
             )
         return json.dumps({"error": f"Chunk not found: {chunk_id}"}, indent=2)
 
-    chunk_data = json.loads(chunk_path.read_text())
-    original_content = chunk_data["original_content"]
-    metadata = chunk_data["metadata"]
+    original_content = row["original_content"]
+    metadata = json.loads(row["metadata"])
 
     return json.dumps(
         {
@@ -945,16 +1039,20 @@ async def search_chunks(query: str, top_k: int = 5) -> str:
 
         # Load compressed preview
         preview = ""
-        chunk_path = CHUNK_STORE / f"{cid}.json"
-        if chunk_path.exists():
-            try:
-                data = json.loads(chunk_path.read_text())
-                compressed = data.get("compressed_content", "")
-                preview = (
-                    compressed[:300] + "..." if len(compressed) > 300 else compressed
-                )
-            except (json.JSONDecodeError, OSError):
-                pass
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute(
+                    "SELECT compressed_content FROM chunks WHERE chunk_id = ?", (cid,)
+                ).fetchone()
+                if row and row[0]:
+                    compressed = row[0]
+                    preview = (
+                        compressed[:300] + "..."
+                        if len(compressed) > 300
+                        else compressed
+                    )
+        except Exception:
+            pass
 
         output_results.append(
             {
@@ -1084,16 +1182,12 @@ async def purge_stale(dry_run: bool = True) -> str:
             )
 
     if not dry_run:
-        for entry in stale:
-            cid = entry["chunk_id"]
-            # Remove chunk file
-            chunk_path = CHUNK_STORE / f"{cid}.json"
-            if chunk_path.exists():
-                chunk_path.unlink()
-            # Remove from index
-            _chunk_index.pop(cid, None)
+        with sqlite3.connect(DB_PATH) as conn:
+            for entry in stale:
+                cid = entry["chunk_id"]
+                conn.execute("DELETE FROM chunks WHERE chunk_id = ?", (cid,))
+                _chunk_index.pop(cid, None)
 
-        _save_manifest(_chunk_index)
         _rebuild_search_index()
 
     return json.dumps(
@@ -1116,8 +1210,11 @@ async def purge_stale(dry_run: bool = True) -> str:
 # ---------------------------------------------------------------------------
 def main() -> None:
     """Start the context-compressor MCP server."""
-    # Load manifest on startup
-    _chunk_index.update(_load_manifest())
+    _init_db()
+    _migrate_json_to_db()
+
+    # Load manifest on startup from DB
+    _chunk_index.update(_load_from_db())
 
     # Build search index from existing chunks
     _rebuild_search_index()

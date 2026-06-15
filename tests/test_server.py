@@ -5,26 +5,26 @@ from pathlib import Path
 
 import pytest
 
+from context_compressor.compressor import SectionSummary
 from context_compressor.server import (
     _chunk_id,
     _content_hash,
-    _section_summaries_to_dicts,
     _interleave_results,
+    _section_summaries_to_dicts,
     compress_pages,
     compress_text,
+    compression_stats,
     expand_chunk,
     get_chunk_metadata,
-    search_chunks,
     list_chunks,
-    compression_stats,
     purge_stale,
+    search_chunks,
 )
-from context_compressor.compressor import SectionSummary
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture
 def tmp_dir(tmp_path: Path):
@@ -68,19 +68,40 @@ Transformer models achieve state-of-the-art results.
 
 
 @pytest.fixture(autouse=True)
-def clean_chunk_index():
-    """Clear the chunk index before each test."""
+def isolated_chunk_store(tmp_path: Path):
+    """Use a temporary directory for CHUNK_STORE and DB_PATH during tests."""
     import context_compressor.server as srv
-    original_index = dict(srv._chunk_index)
+
+    # Save originals
+    orig_store = srv.CHUNK_STORE
+    orig_db = srv.DB_PATH
+    orig_manifest = srv.MANIFEST_PATH
+    orig_index = dict(srv._chunk_index)
+
+    # Override with tmp_path
+    srv.CHUNK_STORE = tmp_path / "test_store"
+    srv.CHUNK_STORE.mkdir(parents=True, exist_ok=True)
+    srv.DB_PATH = srv.CHUNK_STORE / "chunks.db"
+    srv.MANIFEST_PATH = srv.CHUNK_STORE / "manifest.json"
+
+    # Initialize DB and clear memory
+    srv._init_db()
     srv._chunk_index.clear()
+
     yield
+
+    # Restore
+    srv.CHUNK_STORE = orig_store
+    srv.DB_PATH = orig_db
+    srv.MANIFEST_PATH = orig_manifest
     srv._chunk_index.clear()
-    srv._chunk_index.update(original_index)
+    srv._chunk_index.update(orig_index)
 
 
 # ---------------------------------------------------------------------------
 # Utility function tests
 # ---------------------------------------------------------------------------
+
 
 class TestContentHash:
     def test_deterministic(self) -> None:
@@ -162,6 +183,7 @@ class TestInterleaveResults:
 # ---------------------------------------------------------------------------
 # Tool tests (async)
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.asyncio
 class TestCompressPages:
@@ -252,9 +274,7 @@ MCMC methods are widely used in statistics.
 
     async def test_persist_flag(self) -> None:
         text = "A long text " * 50  # ensure enough for compression
-        result_json = await compress_text(
-            text=text, persist=True, label="test-inline"
-        )
+        result_json = await compress_text(text=text, persist=True, label="test-inline")
         result = json.loads(result_json)
         assert "chunk_id" in result
         assert result["persisted"] is True
@@ -264,9 +284,7 @@ MCMC methods are widely used in statistics.
 class TestExpandChunk:
     async def test_expand_existing(self, tmp_dir: Path) -> None:
         doc = tmp_dir / "test_doc.md"
-        compress_result = json.loads(
-            await compress_pages(paths=[str(doc)])
-        )
+        compress_result = json.loads(await compress_pages(paths=[str(doc)]))
         cid = compress_result["chunks"][0]["chunk_id"]
 
         expand_result = json.loads(await expand_chunk(chunk_id=cid))
@@ -283,9 +301,7 @@ class TestExpandChunk:
 class TestGetChunkMetadata:
     async def test_get_metadata(self, tmp_dir: Path) -> None:
         doc = tmp_dir / "test_doc.md"
-        compress_result = json.loads(
-            await compress_pages(paths=[str(doc)])
-        )
+        compress_result = json.loads(await compress_pages(paths=[str(doc)]))
         cid = compress_result["chunks"][0]["chunk_id"]
 
         meta_result = json.loads(await get_chunk_metadata(chunk_id=cid))
@@ -302,6 +318,7 @@ class TestGetChunkMetadata:
 class TestSearchChunks:
     async def test_search_no_index(self) -> None:
         import context_compressor.server as srv
+
         # Ensure search index is empty for this test
         srv._search_index.clear()
 
@@ -345,9 +362,7 @@ class TestListChunks:
         assert result["returned"] >= 1
 
         # Filter by wrong prefix
-        result = json.loads(
-            await list_chunks(source_prefix="/nonexistent/path")
-        )
+        result = json.loads(await list_chunks(source_prefix="/nonexistent/path"))
         assert result["returned"] == 0
 
 
